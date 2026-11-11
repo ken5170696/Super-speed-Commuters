@@ -37,6 +37,79 @@ const S = {
 function saveSettings() { save("settings", S.settings); }
 function saveTrips() { save("trips", S.trips); }
 
+/* ---------------- live traffic (Taipei traffic control centre, free, no key) ---------------- */
+const LIVE_URL = "https://tcgbusfs.blob.core.windows.net/blobtisv/GetVD.xml.gz";
+const LIVE = { map: null, deSec: new Map(), at: null, n: 0, err: null, secs: [], hist: load("liveHist", {}), histSaved: 0 };
+async function loadLive() {
+  try {
+    if (!LIVE.map) {
+      LIVE.map = (await (await fetch("data/vd_map.json")).json()).sections;
+      for (const [sid, m] of Object.entries(LIVE.map)) for (const de of m.de) LIVE.deSec.set(de, sid);
+    }
+    if (!("DecompressionStream" in window)) throw new Error("nodecomp");
+    const res = await fetch(LIVE_URL + "?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) throw new Error("http " + res.status);
+    const txt = await new Response(res.body.pipeThrough(new DecompressionStream("gzip"))).text();
+    const at = (txt.match(/<vd:ExchangeTime>(.*?)<\/vd:ExchangeTime>/) || [])[1];
+    const secs = [];
+    for (const m of txt.matchAll(/<vd:SectionData>([\s\S]*?)<\/vd:SectionData>/g)) {
+      const s = m[1], g = k => { const x = s.match(new RegExp("<vd:" + k + ">(.*?)</vd:" + k + ">")); return x ? x[1] : null; };
+      const id = g("SectionId"); if (!LIVE.map[id]) continue;
+      secs.push({ id, spd: +g("AvgSpd"), moe: +g("MOELevel") });
+    }
+    LIVE.n = Graph.setLive(secs, LIVE.map); LIVE.secs = secs; LIVE.err = null;
+    LIVE.at = at ? new Date(at.replace(/\//g, "-")).getTime() : Date.now();
+    recordHist(secs);
+  } catch (e) { LIVE.err = e.message === "nodecomp" ? "這支手機的瀏覽器版本太舊，讀不了即時路況" : "即時路況暫時讀不到"; }
+  onLive();
+}
+const slotOf = (d = new Date()) => Math.floor(tod(d) / 600);
+function recordHist(secs) {
+  // remember each section's speed per 10-minute slot on weekdays, to know what "usual" is
+  const d = new Date(); if (d.getDay() === 0 || d.getDay() === 6) return;
+  const slot = slotOf(d), day = dateStr(d), H = LIVE.hist;
+  H._seen = H._seen || {};
+  if (H._seen[slot] === day) return;
+  H._seen[slot] = day;
+  for (const s of secs) {
+    if (!(s.spd > 0)) continue;
+    const h = H[s.id] || (H[s.id] = {}); const v = h[slot];
+    h[slot] = v ? [+(v[0] * .75 + s.spd * .25).toFixed(1), Math.min(v[1] + 1, 99)] : [s.spd, 1];
+  }
+  if (Date.now() - LIVE.histSaved > 60000) { LIVE.histSaved = Date.now(); save("liveHist", H); }
+}
+function liveSummary(r) {
+  let cov = 0, busy = 0, jam = 0, tNow = 0, tUsual = 0;
+  const slot = slotOf();
+  for (const e of r.edges) {
+    const L = e.to - e.from; const v = G.vLive[e.de]; if (!(v > 0)) continue;
+    cov += L; if (G.moe[e.de] === 1) busy += L; if (G.moe[e.de] >= 2) jam += L;
+    const sid = LIVE.deSec.get(e.de), u = sid && LIVE.hist[sid] && LIVE.hist[sid][slot];
+    if (u && u[1] >= 3) { tNow += L / v; tUsual += L / u[0]; }
+  }
+  return { cov, busy, jam, vsUsual: tUsual ? tNow / tUsual : null };
+}
+function liveText(r) {
+  if (!LIVE.n) return "";
+  const s = liveSummary(r);
+  if (s.cov < 200) return '<span class="live same">即時路況：這條路線沒有偵測資料</span>';
+  const parts = [];
+  if (s.jam > 50) parts.push(`<span class="live slow">壅塞 ${(s.jam / 1000).toFixed(1)} km</span>`);
+  if (s.busy > 50) parts.push(`<span class="live warn">稍慢 ${(s.busy / 1000).toFixed(1)} km</span>`);
+  if (s.vsUsual) { const p = Math.round((s.vsUsual - 1) * 100); if (Math.abs(p) >= 8) parts.push(`<span class="live ${p > 0 ? "slow" : "fast"}">比平常${p > 0 ? "慢" : "快"} ${Math.abs(p)}%</span>`); }
+  if (!parts.length) parts.push('<span class="live fast">順暢</span>');
+  return `<span class="live same">即時（${(s.cov / 1000).toFixed(1)} km 有資料）：</span>` + parts.join(" ");
+}
+const MOE_COLOR = ["#2fc26b", "#f2b33a", "#e5483d"];
+function liveOverlay(r, layer, w) {
+  for (const e of r.edges) { const m = G.moe[e.de]; if (m < 0) continue; L.polyline(Graph.edgePtsLL(e.de), { color: MOE_COLOR[Math.min(2, m)], weight: w, opacity: .95, interactive: false }).addTo(layer); }
+}
+function onLive() {
+  if (R.on) { R.liveDirty = true; if (R.route) drawRideRoute(); return; }
+  S.plan = { am: null, pm: null };
+  if (!$("v-plan").hidden) renderPlan();
+}
+
 /* ---------------- time helpers ---------------- */
 const tod = (d = new Date()) => d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds() + d.getMilliseconds() / 1000;
 function clock(sec, withSec) { sec = mod(Math.round(sec), 86400); const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60; return pad(h) + ":" + pad(m) + (withSec ? ":" + pad(s) : ""); }
@@ -215,6 +288,7 @@ function renderPlanMap(plan) {
   if (cur) {
     L.polyline(geomLL(cur.r), { color: "#fff", weight: 9, opacity: .9 }).addTo(planLayer);
     L.polyline(geomLL(cur.r), { color: ROUTE_COLORS[S.sel[S.dir] % 5], weight: 6 }).addTo(planLayer);
+    liveOverlay(cur.r, planLayer, 3);
     for (const s of cur.r.signals) L.circleMarker(llOf(s.x, s.y), { radius: 3.5, color: "#fff", weight: 1, fillColor: sigModel(S.dir, s.id) ? "#2fc26b" : "#7f8a92", fillOpacity: 1 }).bindTooltip(s.name).addTo(planLayer);
   }
   L.marker([H.lat, H.lon], { icon: pinIcon("home") }).addTo(planLayer);
@@ -255,10 +329,11 @@ function renderPlan() {
   $("planRoutes").innerHTML = plan.map((o, i) => `<button class="ritem" data-i="${i}" aria-pressed="${i === S.sel[S.dir]}">
       <span class="sw" style="background:${ROUTE_COLORS[i % 5]}"></span>
       <span style="min-width:0"><span class="nm">${esc(o.r.label)}</span><br>
-      <span class="meta">${o.tags.map(t => `<span class="pill ${t === "你最常走的" ? "ok" : "info"}">${esc(t)}</span>`).join(" ")} <span class="num">${(o.r.distance / 1000).toFixed(1)} km</span> · ${o.r.signals.filter(s => s.kind === "junction").length} 路口</span></span>
+      <span class="meta">${o.tags.map(t => `<span class="pill ${t === "你最常走的" ? "ok" : "info"}">${esc(t)}</span>`).join(" ")} <span class="num">${(o.r.distance / 1000).toFixed(1)} km</span> · ${o.r.signals.filter(s => s.kind === "junction").length} 路口</span><br>${liveText(o.r)}</span>
       <span class="t num">${mins(o.sec)}<small>分</small></span></button>`).join("");
   $("planRoutes").querySelectorAll(".ritem").forEach(b => b.onclick = () => { S.sel[S.dir] = +b.dataset.i; renderPlan(); });
-  $("planNote").textContent = S.learned ? `已從你的 ${S.learned} 條軌跡學習常走的路和各路段車速。導航時走別條路，會自動重新規劃。` : "還沒有你的軌跡，時間是一般估計。導航時走別條路會自動重新規劃；騎幾趟後，路線和時間會改成依你的習慣。";
+  const liveLine = LIVE.err ? LIVE.err + "。" : LIVE.n ? `即時路況：台北市交控中心 ${clock(tod(new Date(LIVE.at)))} 更新，${LIVE.n} 個路段（永和段沒有公開資料）。` : "";
+  $("planNote").textContent = liveLine + (S.learned ? `已從你的 ${S.learned} 條軌跡學習常走的路和各路段車速。導航時走別條路，會自動重新規劃。` : "還沒有你的軌跡，時間是一般估計。導航時走別條路會自動重新規劃；騎幾趟後，路線和時間會改成依你的習慣。");
   renderPlanMap(plan);
 }
 
@@ -298,7 +373,7 @@ async function startRide(opts = {}) {
   wakeLock();
   speak(opts.auto ? "偵測到你在騎車，已自動開始導航和記錄" : "開始導航");
   R.watch = navigator.geolocation.watchPosition(onFix, onGeoErr, { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
-  R.tick = setInterval(renderRide, 1000);
+  R.tick = setInterval(() => { renderRide(); if (R.liveDirty) { R.liveDirty = false; R.lastBetter = 0; } checkBetterRoute(); }, 1000);
   renderRide();
 }
 function drawRideRoute() {
@@ -307,6 +382,7 @@ function drawRideRoute() {
   rideRoute = L.polyline(ll, { color: "#3d8cf0", weight: 8, opacity: .95 }).addTo(rideMap);
   rideDone = L.polyline([], { color: "#6b7780", weight: 8, opacity: .9 }).addTo(rideMap);
   sigLayer.clearLayers();
+  liveOverlay(R.route, sigLayer, 4);
   for (const s of R.route.signals) L.marker(llOf(s.x, s.y), { icon: L.divIcon({ className: "", html: `<div class="sigmk" style="background:${sigModel(R.dir, s.id) ? "#2fc26b" : "#9aa3a9"}"></div>`, iconSize: [12, 12] }) }).addTo(sigLayer);
   if (!R.pred) R.pred = routeTime(R.route, 0, R.dir) * calibFactor(R.dir);
 }
@@ -346,6 +422,22 @@ function reroute(fix, initial) {
   R.route = r; R.off = 0; R.d = 0; R.dist = 0;
   drawRideRoute();
   if (!initial) { R.reroutes++; const t = r.turns[0]; speak("已改走你目前的路線" + (t ? `，${Math.round(t.d / 50) * 50 || 50}公尺後${turnWord(t.dir)}，${t.onto}` : "")); }
+}
+function checkBetterRoute() {
+  if (!R.route || !R.last || R.off) return;
+  if (Date.now() - (R.lastBetter || 0) < 60000) return;
+  R.lastBetter = Date.now();
+  const f = R.last;
+  const alt = Graph.route({ x: f.xy[0], y: f.xy[1], heading: f.v > 2 ? f.hd : null }, { x: R.dest[0], y: R.dest[1] }, { habit: hasHabit() ? .6 : 0 });
+  if (!alt) return;
+  const cur = routeTime(R.route, R.d || 0, R.dir), nt = routeTime(alt, 0, R.dir);
+  const same = Math.abs(alt.distance - (R.route.distance - (R.d || 0))) < 150 && alt.label === R.route.label;
+  if (!same && nt < cur - 90) {
+    R.route = alt; R.d = 0; R.off = 0; drawRideRoute();
+    const ls = liveSummary(alt);
+    speak(`前方${ls.jam > 0 ? "壅塞" : "車流較慢"}，改走 ${alt.label.split(" → ").slice(0, 2).join("、")}，約快 ${Math.max(1, Math.round((cur - nt) / 60))} 分鐘`);
+    toast("依即時路況改走較快的路線");
+  }
 }
 function detectStops(f) {
   if (f.v < 1.2) { if (R.stopStart == null) { R.stopStart = f.t; R.stopXY = f.xy; } }
@@ -778,8 +870,9 @@ async function boot() {
   learnFromTracks().then(() => { S.plan = { am: null, pm: null }; renderAll(); });
   startPassive();
   setInterval(() => { if (!R.on && !$("v-plan").hidden) renderPlan(); }, 30000);
+  loadLive(); setInterval(() => { if (document.visibilityState === "visible") loadLive(); }, 60000);
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => { });
-  window.__ssc = { S, R, G, fitCycle, sigModel, startRide, finishRide, analyzeTrack, learnFromTracks, DB, openTrip, onFix, computePlan };
+  window.__ssc = { S, R, G, LIVE, loadLive, fitCycle, sigModel, startRide, finishRide, analyzeTrack, learnFromTracks, DB, openTrip, onFix, computePlan };
 }
 boot();
 })();

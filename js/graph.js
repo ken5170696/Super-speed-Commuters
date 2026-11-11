@@ -64,6 +64,8 @@ async function load(url) {
   }
   G.habit = new Float32Array(2 * M);   // times the rider used each directed edge
   G.vLearn = new Float32Array(2 * M);  // learned moving speed (m/s) per directed edge
+  G.vLive = new Float32Array(2 * M);   // live road speed (km/h) from Taipei traffic control, 0 = none
+  G.moe = new Int8Array(2 * M).fill(-1); // live congestion level: 0 smooth, 1 busy, 2 congested
   G.ready = true;
   return G;
 }
@@ -118,7 +120,27 @@ function nearEdges(x, y, maxD, heading) {
 }
 
 /* ---------- cost model ---------- */
-function vOf(de) { return G.vLearn[de] > 1 ? G.vLearn[de] : SPEED_KMH[G.ecls[deE(de)]] / 3.6; }
+function vOf(de) {
+  const base = G.vLearn[de] > 1 ? G.vLearn[de] : SPEED_KMH[G.ecls[deE(de)]] / 3.6;
+  const live = G.vLive[de];
+  // live detector speed relative to a typical free-flowing arterial (~45 km/h)
+  return live > 0 ? base * Math.max(.4, Math.min(1.1, live / 45)) : base;
+}
+function setLive(sections, vdMap) {
+  G.vLive.fill(0); G.moe.fill(-1);
+  let n = 0;
+  for (const s of sections) {
+    const m = vdMap[s.id]; if (!m || !(s.spd > 0) || s.moe < 0) continue;
+    for (const de of m.de) { G.vLive[de] = s.spd; G.moe[de] = s.moe; }
+    n++;
+  }
+  // extend each detector's reading along the same road where nothing closer was measured
+  for (const s of sections) {
+    const m = vdMap[s.id]; if (!m || !m.x || !(s.spd > 0) || s.moe < 0) continue;
+    for (const de of m.x) if (!(G.vLive[de] > 0)) { G.vLive[de] = s.spd; G.moe[de] = s.moe; }
+  }
+  return n;
+}
 function edgeCost(de, habitW) {
   const t = G.len[deE(de)] / vOf(de);
   if (!habitW) return t;
@@ -351,5 +373,5 @@ function matchTrack(pts) {
   return out;
 }
 
-global.Graph = { G, load, route, project, matchTrack, toXY, toLL, nameOf, shortName, deE, deTo, deFrom, timeAlong, priorDelay, vOf, nearEdges, SPEED_KMH, sigNameById, sigNodeXY, nearestSignal };
+global.Graph = { G, load, route, project, matchTrack, toXY, toLL, nameOf, shortName, deE, deTo, deFrom, timeAlong, priorDelay, vOf, nearEdges, SPEED_KMH, sigNameById, sigNodeXY, nearestSignal, setLive, edgePtsLL: de => dePts(de).map(p => toLL(p[0], p[1])) };
 })(window);

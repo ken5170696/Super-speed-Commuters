@@ -76,6 +76,7 @@ td.r,th.r{text-align:right}
 .pick-map{height:58vh}
 .trip-map{height:360px}
 .leaflet-container{background:var(--surface-2);font-family:var(--font)}
+@media (prefers-color-scheme: dark){.leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.9) contrast(.9)}}
 .pin{width:30px;height:30px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);display:grid;place-items:center;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.4)}
 .pin span{transform:rotate(45deg);color:#fff;font-weight:900;font-size:13px}
 .pin.home{background:#1c7c48}.pin.office{background:#1a5fb4}

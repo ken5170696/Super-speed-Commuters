@@ -87,4 +87,4 @@ python3 tools/build_graph.py --tiles /path/to/osm-tiles --out data/graph.json
 python3 -m http.server 8000
 ```
 
-地圖 © OpenStreetMap 貢獻者、© CARTO。路網資料 © OpenStreetMap（ODbL）。
+地圖 © OpenStreetMap 貢獻者。路網資料 © OpenStreetMap（ODbL）。

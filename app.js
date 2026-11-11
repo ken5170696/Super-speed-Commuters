@@ -193,8 +193,8 @@ function computePlan(dir) {
 /* ---------------- maps ---------------- */
 const dark = () => matchMedia("(prefers-color-scheme: dark)").matches;
 function baseLayer() {
-  const style = dark() ? "dark_all" : "rastertiles/voyager";
-  return L.tileLayer(`https://{s}.basemaps.cartocdn.com/${style}/{z}/{x}/{y}{r}.png`, { subdomains: "abcd", maxZoom: 20, attribution: "© OpenStreetMap © CARTO" });
+  // OpenStreetMap standard tiles (no key). Dark mode darkens them with a CSS filter on the tile pane.
+  return L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' });
 }
 function mkMap(id, opts = {}) {
   const m = L.map(id, Object.assign({ zoomControl: false, attributionControl: true }, opts));

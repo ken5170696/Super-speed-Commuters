@@ -565,6 +565,22 @@ function summarize(tr, dir, source, pred) {
   const majors = []; for (const r of a.roads) if (r.dist > 300 && !/[巷弄]/.test(r.name) && r.name !== "無名道路" && majors[majors.length - 1] !== r.name) majors.push(r.name);
   return { id: tr.id, date: dateStr(t0), dir, depart: Math.round(tod(t0)), arrive: Math.round(tod(t1)), duration: Math.round(dur), dist: Math.round(a.dist), moving: Math.round(a.moving), stopped: Math.round(a.stopped), nStops: a.stops.length, sigStops: a.stops.filter(s => s.sid).length, vAvg: a.moving ? +(a.dist / a.moving * 3.6).toFixed(1) : null, vMax: Math.round(a.vmax * 3.6), label: majors.slice(0, 5).join(" → "), pred: pred ? Math.round(pred) : null, source, hasTrack: true };
 }
+/* make sure every stored track has a detailed summary: tracks from the first version,
+   and rides whose page was closed before "結束" (saved every 20 s), get one here */
+async function repairTrips() {
+  let fixed = 0;
+  for (const tr of await DB.all()) {
+    if (!tr.pts || tr.pts.length < 30 || (R.on && tr.id === R.id)) continue;
+    const old = S.trips.find(x => x.id === tr.id);
+    if (old && old.hasTrack && old.dist != null) continue;
+    const dir = old ? old.dir : (/_pm_/.test(tr.id) ? "pm" : /_am_/.test(tr.id) ? "am" : dirFor(tr.pts));
+    const sum = summarize(tr, dir, old ? old.source || "nav" : "nav", old ? old.pred : null);
+    if (tr.partial) sum.partial = true;
+    S.trips = S.trips.filter(x => x.id !== tr.id).concat(sum); fixed++;
+  }
+  if (fixed) { S.trips.sort((a, b) => a.id < b.id ? -1 : 1); saveTrips(); }
+  return fixed;
+}
 function upsertTrip(t) { S.trips = S.trips.filter(x => x.id !== t.id).concat(t).sort((a, b) => a.id < b.id ? -1 : 1); saveTrips(); }
 
 /* passive watch: detect riding while the app is open and start automatically */
@@ -645,7 +661,7 @@ function renderRecords() {
   const by = d => tr.filter(t => t.dir === d && t.duration > 300).map(t => t.duration);
   $("tripStats").innerHTML = `<p class="small">共 ${tr.length} 趟（上班 ${by("am").length} 趟，中位數 ${by("am").length ? mins(median(by("am"))) : "—"} 分；下班 ${by("pm").length} 趟，中位數 ${by("pm").length ? mins(median(by("pm"))) : "—"} 分）。</p>`;
   $("tripList").innerHTML = tr.slice().reverse().slice(0, 60).map(t => `<button class="trip-row" data-id="${esc(t.id)}"><span style="min-width:0"><span class="nm">${t.date.slice(5).replace("-", "/")} ${DIRNAME[t.dir]} · ${clock(t.depart)} 出發</span><br>
-    <span class="st">${t.hasTrack ? `${(t.dist / 1000).toFixed(1)} km · 停 ${t.nStops} 次 · 行駛均速 ${t.vAvg || "—"} km/h${t.label ? " · " + esc(t.label) : ""}` : "只有時間軸紀錄（沒有詳細軌跡）"}</span></span>
+    <span class="st">${t.partial ? "（未按結束，已自動保存）" : ""}${t.hasTrack ? `${(t.dist / 1000).toFixed(1)} km · 停 ${t.nStops} 次 · 行駛均速 ${t.vAvg || "—"} km/h${t.label ? " · " + esc(t.label) : ""}` : "只有時間軸紀錄（沒有詳細軌跡）"}</span></span>
     <span class="t num">${mins(t.duration)}<small class="small"> 分</small></span></button>`).join("");
   $("tripList").querySelectorAll(".trip-row").forEach(b => b.onclick = () => openTrip(b.dataset.id));
 }
@@ -867,6 +883,7 @@ async function boot() {
     $("clearNo").onclick = () => location.reload();
   };
   renderAll();
+  await repairTrips();
   learnFromTracks().then(() => { S.plan = { am: null, pm: null }; renderAll(); });
   startPassive();
   setInterval(() => { if (!R.on && !$("v-plan").hidden) renderPlan(); }, 30000);

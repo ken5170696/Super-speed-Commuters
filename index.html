@@ -12,6 +12,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -20,78 +21,106 @@
   <!-- 出發 -->
   <section class="view" id="v-plan">
     <header class="bar">
-      <div><div class="eyebrow">MT15 · 永和 ⇄ 松江路</div><h1>綠波通勤</h1></div>
+      <div><div class="eyebrow">永和 ⇄ 松江路</div><h1>綠波通勤</h1></div>
       <div class="seg" role="group" aria-label="方向">
         <button id="dAm" aria-pressed="true">上班</button><button id="dPm" aria-pressed="false">下班</button>
       </div>
     </header>
+    <div class="card onboard" id="onboard" hidden>
+      <h2>先設定家和公司</h2>
+      <p class="note">在地圖上點選你家和公司的位置，路線就能從家門口算到公司門口。位置只存在這支手機。</p>
+      <button class="big go" id="obSet">在地圖上設定</button>
+    </div>
     <div class="card hero" id="planHero"></div>
+    <div class="mapbox plan-map"><div id="planMap" class="map"></div></div>
     <div class="list" id="planRoutes"></div>
-    <p class="note" id="liveNote"></p>
+    <p class="note" id="planNote"></p>
     <button class="big go" id="startBtn">開始導航</button>
-    <p class="note">騎乘時請把手機固定在手機架上，不要手持操作。導航會保持螢幕亮著，並每秒記錄 GPS。</p>
+    <label class="row small"><input type="checkbox" id="optAuto"> 打開這個網頁時，偵測到你在騎車就自動開始導航和記錄</label>
   </section>
 
   <!-- 騎乘 -->
   <section class="view ride" id="v-ride" hidden>
-    <div class="ride-top">
-      <div class="clock num" id="rClock">--:--</div>
-      <div class="eta" id="rEta">定位中…</div>
+    <div id="rideMap" class="map ride-map"></div>
+    <div class="ride-ui">
+      <div class="maneuver" id="rMan">
+        <div class="man-icon" id="rManIcon"></div>
+        <div class="man-text"><div class="man-dist num" id="rManDist">—</div><div class="man-road" id="rManRoad">等待 GPS 定位</div></div>
+      </div>
+      <div class="sigchip" id="rSig"></div>
     </div>
-    <div class="sig-card" id="rSig">
-      <div class="sig-dist num" id="rSigDist">—</div>
-      <div class="sig-name" id="rSigName">等待 GPS</div>
-      <div class="sig-adv" id="rAdv"></div>
-    </div>
-    <div class="turn" id="rTurn"></div>
     <div class="ride-bottom">
       <div class="speed"><span class="num spd" id="rSpeed">0</span><small>km/h</small></div>
-      <div class="ride-route" id="rRoute"></div>
+      <div class="eta-box"><div class="eta num" id="rEta">--:--</div><div class="small" id="rRemain"></div></div>
     </div>
     <div class="ride-actions">
-      <button class="big stamp" id="rStamp" disabled>綠燈亮</button>
-      <button class="big ghost" id="rStop">結束</button>
+      <button class="btn-ride stamp" id="rStamp" disabled>綠燈亮</button>
+      <button class="btn-ride" id="rRecenter">置中</button>
+      <button class="btn-ride stop" id="rStop">結束</button>
     </div>
     <div class="gps-status" id="rGps"></div>
   </section>
 
   <!-- 號誌 -->
   <section class="view" id="v-sig" hidden>
-    <header class="bar"><div><div class="eyebrow">自動學習 ＋ 手動登記</div><h1>號誌</h1></div>
+    <header class="bar"><div><div class="eyebrow">從你的停等自動學習</div><h1>號誌</h1></div>
       <div class="seg" role="group" aria-label="時段"><button id="sAm" aria-pressed="true">早上</button><button id="sPm" aria-pressed="false">傍晚</button></div></header>
-    <p class="note">每次你在號誌前停下再起步，起步時刻就是一次「綠燈亮」的觀察。同一個路口累積 4 次以上，就會推算週期，騎乘時預測燈號。也可以手動登記。</p>
+    <p class="note">每次在號誌前停下再起步，起步時刻會記成一次「綠燈亮」。同一個路口、同一時段累積 4 次以上，就會推算週期，騎乘時預測燈號。</p>
     <div class="list" id="sigList"></div>
     <div class="card" id="sigEdit" hidden></div>
   </section>
 
-  <!-- 紀錄與設定 -->
+  <!-- 紀錄 -->
   <section class="view" id="v-set" hidden>
-    <header class="bar"><div><div class="eyebrow">資料只存在這支手機</div><h1>紀錄與設定</h1></div></header>
+    <header class="bar"><div><div class="eyebrow">資料只存在這支手機</div><h1>紀錄</h1></div></header>
+    <div class="card"><h2>通勤紀錄</h2><div id="tripStats"></div><div class="list" id="tripList"></div></div>
     <div class="card">
       <h2>家與公司</h2>
-      <p class="note">站在家門口或公司門口時按下，用來判斷出發和抵達。位置只存在這支手機，不會上傳。</p>
-      <div class="row"><button class="btn" id="setHome">把目前位置設為「家」</button><span class="small" id="homeVal"></span></div>
-      <div class="row"><button class="btn" id="setOffice">把目前位置設為「公司」</button><span class="small" id="officeVal"></span></div>
+      <p class="small" id="placeVal"></p>
+      <div class="row wrap"><button class="btn" id="openPicker">在地圖上設定</button></div>
     </div>
     <div class="card">
-      <h2>通勤紀錄</h2>
-      <div id="tripStats"></div>
+      <h2>資料</h2>
       <div class="row wrap">
-        <button class="btn" id="expGpx">匯出 GPX（給分析網頁）</button>
+        <button class="btn" id="expGpx">匯出全部 GPX</button>
         <button class="btn" id="expJson">備份全部資料</button>
         <label class="btn" for="impFile">匯入（時間軸 / GPX / 備份）</label>
-        <input type="file" id="impFile" accept=".json,.gpx,.kml,.csv" multiple hidden>
+        <input type="file" id="impFile" accept=".json,.gpx" multiple hidden>
       </div>
       <p class="small" id="impMsg"></p>
-      <div id="tripList"></div>
     </div>
     <div class="card">
       <h2>偏好</h2>
       <label class="row"><input type="checkbox" id="optVoice" checked> 語音提示</label>
-      <label class="row"><input type="checkbox" id="optRecord" checked> 導航時記錄 GPS 軌跡</label>
+      <label class="row"><input type="checkbox" id="optMotion" checked> 同時記錄加速度感測器（判斷起步、煞車更準）</label>
       <div class="row wrap"><span class="small">上班要在幾點前到：</span><input type="time" id="optDeadline" value="09:00"></div>
       <div class="row wrap" id="clearBox"><button class="btn danger" id="clearAll">清除這支手機上的所有資料</button></div>
     </div>
+    <p class="note">地圖 © OpenStreetMap 貢獻者、© CARTO。路網資料 © OpenStreetMap（ODbL）。</p>
+  </section>
+
+  <!-- 家與公司地圖選點 -->
+  <section class="view" id="v-pick" hidden>
+    <header class="bar"><div><div class="eyebrow">點地圖或拖曳圖釘</div><h1>家與公司</h1></div></header>
+    <div class="seg wide" role="group" aria-label="要設定的地點">
+      <button id="pkHome" aria-pressed="true">設定「家」</button><button id="pkOffice" aria-pressed="false">設定「公司」</button>
+    </div>
+    <div class="mapbox pick-map"><div id="pickMap" class="map"></div></div>
+    <div class="row wrap"><button class="btn" id="pkHere">用目前位置</button><span class="small" id="pkMsg"></span></div>
+    <div class="row"><button class="big go" id="pkSave">儲存</button></div>
+    <div class="row"><button class="big ghost" id="pkCancel">取消</button></div>
+  </section>
+
+  <!-- 單趟詳細 -->
+  <section class="view" id="v-trip" hidden>
+    <header class="bar"><div><div class="eyebrow" id="tEyebrow"></div><h1 id="tTitle">這一趟</h1></div><button class="btn" id="tBack">返回</button></header>
+    <div class="stats" id="tStats"></div>
+    <div class="mapbox trip-map"><div id="tripMap" class="map"></div></div>
+    <div class="legend" id="tLegend"></div>
+    <div class="card"><h2>速度與停等</h2><div class="chart" id="tChart"></div></div>
+    <div class="card"><h2>號誌停等</h2><div id="tStops"></div></div>
+    <div class="card"><h2>經過的道路</h2><div id="tRoads"></div></div>
+    <div class="row wrap" id="tActions"></div>
   </section>
 
   <nav class="tabs" id="tabs">
@@ -101,6 +130,8 @@
   </nav>
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="js/graph.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

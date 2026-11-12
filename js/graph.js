@@ -276,6 +276,7 @@ function describe(path, f0, f1, opts) {
     const t = angDiff(deBearOut(nd.outDe), deBearIn(nd.inDe));
     const onto = shortName(nameOf(deE(nd.outDe))) || "無名道路";
     const fromName = shortName(nameOf(deE(nd.inDe)));
+    if (onto === fromName && Math.abs(t) < 1.25) continue;   // bends and jogs along the same road are not turns
     if (Math.abs(t) >= .6) turns.push({ d: nd.d, dir: Math.abs(t) > 2.6 ? "U" : t < 0 ? "L" : "R", onto, angle: t });
     else if (Math.abs(t) >= .3 && onto !== fromName && G.out[nd.n].length > 2) turns.push({ d: nd.d, dir: t < 0 ? "SL" : "SR", onto, angle: t });
   }

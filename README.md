@@ -2,7 +2,7 @@
 
 永和 ⇄ 台北松江路的機車通勤導航網頁。它會：
 
-- **地圖即時導航**：轉彎提示加語音。走了不同的路，會依你目前的位置自動重新規劃。
+- **地圖即時導航**：向量地圖，放大不會模糊；地圖隨行進方向旋轉、傾斜成 3D 視角；轉彎提示加語音。走了不同的路，會依你目前的位置自動重新規劃。
 - **學習你的習慣**：從你騎過的軌跡，學會你常走哪些路、每段路實際騎多快，以及每個路口的號誌週期。
 
 網址：<https://ken5170696.github.io/Super-speed-Commuters/>
@@ -72,7 +72,7 @@ node tools/build_vd_map.js
 
 - iPhone 的網頁在螢幕關掉或切到其他 App 時會停止定位。導航時會請求螢幕保持開啟，請不要鎖定螢幕。
 - 路網涵蓋永和到中山區（約北緯 24.992–25.054、東經 121.506–121.548）。超出範圍無法規劃路線。
-- 地圖底圖需要網路。路網和規劃都在手機上計算。
+- 地圖底圖需要網路（[OpenFreeMap](https://openfreemap.org/) 免費向量圖磚，不需金鑰）。路網和規劃都在手機上計算。
 
 ## 隱私
 
@@ -102,4 +102,4 @@ python3 tools/build_graph.py --tiles /path/to/osm-tiles --out data/graph.json
 python3 -m http.server 8000
 ```
 
-地圖 © OpenStreetMap 貢獻者。路網資料 © OpenStreetMap（ODbL）。
+地圖 © OpenFreeMap、© OpenMapTiles、© OpenStreetMap 貢獻者。路網資料 © OpenStreetMap（ODbL）。

@@ -100,10 +100,6 @@ function liveText(r) {
   if (!parts.length) parts.push('<span class="live fast">順暢</span>');
   return `<span class="live same">即時（${(s.cov / 1000).toFixed(1)} km 有資料）：</span>` + parts.join(" ");
 }
-const MOE_COLOR = ["#2fc26b", "#f2b33a", "#e5483d"];
-function liveOverlay(r, layer, w) {
-  for (const e of r.edges) { const m = G.moe[e.de]; if (m < 0) continue; L.polyline(Graph.edgePtsLL(e.de), { color: MOE_COLOR[Math.min(2, m)], weight: w, opacity: .95, interactive: false }).addTo(layer); }
-}
 function onLive() {
   if (R.on) { R.liveDirty = true; if (R.route) drawRideRoute(); return; }
   S.plan = { am: null, pm: null };
@@ -263,39 +259,73 @@ function computePlan(dir) {
   return out.filter(o => o.sec <= min * 1.35 || o.tags.includes("你最常走的")).sort((x, y) => x.sec - y.sec);
 }
 
-/* ---------------- maps ---------------- */
+/* ---------------- maps (MapLibre + OpenFreeMap vector tiles: sharp at any zoom, rotates with heading) ---------------- */
+const STYLE = { nav: "https://tiles.openfreemap.org/styles/liberty", light: "https://tiles.openfreemap.org/styles/positron", dark: "https://tiles.openfreemap.org/styles/dark" };
 const dark = () => matchMedia("(prefers-color-scheme: dark)").matches;
-function baseLayer() {
-  // OpenStreetMap standard tiles (no key). Dark mode darkens them with a CSS filter on the tile pane.
-  return L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' });
-}
+const lngLat = (x, y) => { const ll = Graph.toLL(x, y); return [ll[1], ll[0]]; };
+const routeCoords = r => r.geom.map(p => lngLat(p[0], p[1]));
+const fc = features => ({ type: "FeatureCollection", features });
+const lineF = (coords, props = {}) => ({ type: "Feature", properties: props, geometry: { type: "LineString", coordinates: coords } });
+const ptF = (c, props = {}) => ({ type: "Feature", properties: props, geometry: { type: "Point", coordinates: c } });
+const FONT = ["Noto Sans Regular"];
 function mkMap(id, opts = {}) {
-  const m = L.map(id, Object.assign({ zoomControl: false, attributionControl: true }, opts));
-  baseLayer().addTo(m); m.attributionControl.setPrefix(false);
+  const m = new maplibregl.Map({
+    container: id, style: opts.style || (dark() ? STYLE.dark : STYLE.light), center: [121.525, 25.022], zoom: 13,
+    attributionControl: false, dragRotate: !!opts.nav, touchPitch: !!opts.nav, maxPitch: 65, fadeDuration: 0,
+  });
+  m.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
+  if (opts.zoomCtl) m.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+  m.ready = new Promise(res => m.on("load", () => {
+    // Chinese street names; hide shop/POI clutter on the navigation map
+    for (const l of m.getStyle().layers) {
+      if (l.type === "symbol" && l.layout && l.layout["text-field"]) m.setLayoutProperty(l.id, "text-field", ["coalesce", ["get", "name:zh-Hant"], ["get", "name:zh"], ["get", "name"]]);
+      if (opts.nav && /^poi|airport|^label_other/.test(l.id)) m.setLayoutProperty(l.id, "visibility", "none");
+    }
+    const at = m.getContainer().querySelector(".maplibregl-ctrl-attrib"); if (at) at.classList.remove("maplibregl-compact-show");
+    res();
+  }));
   return m;
 }
-const llOf = (x, y) => Graph.toLL(x, y);
-const geomLL = r => r.geom.map(p => llOf(p[0], p[1]));
-const pinIcon = kind => L.divIcon({ className: "", html: `<div class="pin ${kind}"><span>${kind === "home" ? "家" : "公"}</span></div>`, iconSize: [30, 30], iconAnchor: [15, 30] });
-let planMap, planLayer;
-function renderPlanMap(plan) {
-  if (!planMap) { planMap = mkMap("planMap"); planLayer = L.layerGroup().addTo(planMap); }
-  planLayer.clearLayers();
-  const H = S.settings.home, O = S.settings.office;
-  if (!H || !O) { planMap.setView([25.02, 121.525], 13); return; }
-  plan.forEach((o, i) => { if (i !== S.sel[S.dir]) L.polyline(geomLL(o.r), { color: ROUTE_COLORS[i % 5], weight: 4, opacity: .55 }).on("click", () => { S.sel[S.dir] = i; renderPlan(); }).addTo(planLayer); });
-  const cur = plan[S.sel[S.dir]];
-  if (cur) {
-    L.polyline(geomLL(cur.r), { color: "#fff", weight: 9, opacity: .9 }).addTo(planLayer);
-    L.polyline(geomLL(cur.r), { color: ROUTE_COLORS[S.sel[S.dir] % 5], weight: 6 }).addTo(planLayer);
-    liveOverlay(cur.r, planLayer, 3);
-    for (const s of cur.r.signals) L.circleMarker(llOf(s.x, s.y), { radius: 3.5, color: "#fff", weight: 1, fillColor: sigModel(S.dir, s.id) ? "#2fc26b" : "#7f8a92", fillOpacity: 1 }).bindTooltip(s.name).addTo(planLayer);
-  }
-  L.marker([H.lat, H.lon], { icon: pinIcon("home") }).addTo(planLayer);
-  L.marker([O.lat, O.lon], { icon: pinIcon("office") }).addTo(planLayer);
-  planMap.invalidateSize();
-  planMap.fitBounds(L.latLngBounds([[H.lat, H.lon], [O.lat, O.lon]]).pad(.15));
+function setGeo(m, id, data) { const s = m.getSource(id); if (s) s.setData(data); else m.addSource(id, { type: "geojson", data }); }
+function addLayer(m, layer) { if (!m.getLayer(layer.id)) m.addLayer(layer); }
+const ROUND = { "line-cap": "round", "line-join": "round" };
+function pinEl(kind) { const d = document.createElement("div"); d.innerHTML = `<div class="pinwrap"><div class="pin ${kind}"><span>${kind === "home" ? "家" : "公"}</span></div></div>`; return d.firstChild; }
+function fitTo(m, coords, pad = 40) {
+  if (!coords.length) return;
+  const b = coords.reduce((b, c) => b.extend(c), new maplibregl.LngLatBounds(coords[0], coords[0]));
+  m.fitBounds(b, { padding: pad, duration: 0, maxZoom: 17, bearing: 0, pitch: 0 });
 }
+const MOE_COLOR = ["#2fc26b", "#f2a33a", "#e5483d"];
+function trafficFeatures(r, fromD = 0) {
+  const f = [];
+  for (const e of r.edges) { if (e.to < fromD) continue; const mo = G.moe[e.de]; if (mo < 1) continue; f.push(lineF(Graph.edgePtsLL(e.de).map(p => [p[1], p[0]]), { c: MOE_COLOR[Math.min(2, mo)] })); }
+  return f;
+}
+let planMap, planMk = [];
+async function renderPlanMap(plan) {
+  if (!planMap) {
+    planMap = mkMap("planMap");
+    planMap.on("click", "plan-alt", e => { S.sel[S.dir] = e.features[0].properties.i; renderPlan(); });
+  }
+  await planMap.ready; planMap.resize();
+  const H = S.settings.home, O = S.settings.office;
+  const cur = plan[S.sel[S.dir]];
+  setGeo(planMap, "plan-alt", fc(plan.map((o, i) => i === S.sel[S.dir] ? null : lineF(routeCoords(o.r), { i, c: ROUTE_COLORS[i % 5] })).filter(Boolean)));
+  setGeo(planMap, "plan-cur", fc(cur ? [lineF(routeCoords(cur.r), { c: ROUTE_COLORS[S.sel[S.dir] % 5] })] : []));
+  setGeo(planMap, "plan-traffic", fc(cur ? trafficFeatures(cur.r) : []));
+  setGeo(planMap, "plan-sig", fc(cur ? cur.r.signals.map(s => ptF(lngLat(s.x, s.y), { c: sigModel(S.dir, s.id) ? "#2fc26b" : "#8a949b" })) : []));
+  addLayer(planMap, { id: "plan-alt", type: "line", source: "plan-alt", layout: ROUND, paint: { "line-color": ["get", "c"], "line-width": 5, "line-opacity": .55 } });
+  addLayer(planMap, { id: "plan-cur-case", type: "line", source: "plan-cur", layout: ROUND, paint: { "line-color": "#ffffff", "line-width": 10 } });
+  addLayer(planMap, { id: "plan-cur", type: "line", source: "plan-cur", layout: ROUND, paint: { "line-color": ["get", "c"], "line-width": 6 } });
+  addLayer(planMap, { id: "plan-traffic", type: "line", source: "plan-traffic", layout: ROUND, paint: { "line-color": ["get", "c"], "line-width": 3 } });
+  addLayer(planMap, { id: "plan-sig", type: "circle", source: "plan-sig", minzoom: 13.5, paint: { "circle-radius": ["interpolate", ["linear"], ["zoom"], 13.5, 2.5, 17, 6], "circle-color": ["get", "c"], "circle-stroke-color": "#fff", "circle-stroke-width": 1.5 } });
+  planMk.forEach(m => m.remove()); planMk = [];
+  if (!H || !O) { planMap.jumpTo({ center: [121.525, 25.022], zoom: 12.5 }); return; }
+  planMk.push(new maplibregl.Marker({ element: pinEl("home"), anchor: "bottom" }).setLngLat([H.lon, H.lat]).addTo(planMap));
+  planMk.push(new maplibregl.Marker({ element: pinEl("office"), anchor: "bottom" }).setLngLat([O.lon, O.lat]).addTo(planMap));
+  fitTo(planMap, cur ? routeCoords(cur.r) : [[H.lon, H.lat], [O.lon, O.lat]], 36);
+}
+
 
 /* ---------------- plan view ---------------- */
 function renderPlan() {
@@ -339,7 +369,7 @@ function renderPlan() {
 
 /* ---------------- ride engine ---------------- */
 const R = { on: false };
-let rideMap, rideRoute, rideDone, meMk, sigLayer;
+let rideMap, puck;
 function speak(text, key) {
   if (!S.settings.voice || !("speechSynthesis" in window)) return;
   if (key) { if (R.said[key]) return; R.said[key] = 1; }
@@ -358,17 +388,24 @@ async function startRide(opts = {}) {
   const plan = S.plan[dir] || computePlan(dir);
   const chosen = opts.auto ? null : plan[S.sel[dir]];
   stopPassive();
-  Object.assign(R, { on: true, dir, dest: xyOf(dest), route: chosen ? chosen.r : null, pts: [], said: {}, off: 0, lastReroute: 0, follow: true, stopStart: null, stopsLog: [], aMax: null, startT: Date.now(), id: null, pred: null, arriveT: null, lastSave: 0, reroutes: 0 });
+  Object.assign(R, { on: true, dir, dest: xyOf(dest), destLL: dest, route: chosen ? chosen.r : null, pts: [], said: {}, off: 0, lastReroute: 0, follow: true, stopStart: null, stopsLog: [], aMax: null, startT: Date.now(), id: null, pred: null, arriveT: null, lastSave: 0, reroutes: 0, hdSm: null, last: null, d: 0 });
   if (S.settings.motion && window.DeviceMotionEvent) {
     try { if (typeof DeviceMotionEvent.requestPermission === "function" && !opts.auto) await DeviceMotionEvent.requestPermission(); window.addEventListener("devicemotion", onMotion); } catch (e) { }
   }
   document.body.classList.add("riding"); show("ride");
   if (!rideMap) {
-    rideMap = mkMap("rideMap", { zoomControl: false });
-    sigLayer = L.layerGroup().addTo(rideMap);
-    rideMap.on("dragstart", () => { R.follow = false; });
+    rideMap = mkMap("rideMap", { style: STYLE.nav, nav: true });
+    const el = document.createElement("div"); el.className = "puck"; el.innerHTML = "<i></i>";
+    puck = new maplibregl.Marker({ element: el, rotationAlignment: "map", pitchAlignment: "map" }).setLngLat([121.52, 25.02]);
+    rideMap.on("dragstart", () => setFollow(false));
+    rideMap.on("click", "r-sig", e => { const p = e.features[0].properties; toast(p.name + (p.lab ? " · " + p.lab : "")); });
+    await rideMap.ready;
+    initRideLayers();
   }
-  rideMap.invalidateSize();
+  await rideMap.ready;
+  rideMap.resize();
+  puck.addTo(rideMap);
+  setFollow(true);
   if (R.route) drawRideRoute();
   wakeLock();
   speak(opts.auto ? "偵測到你在騎車，已自動開始導航和記錄" : "開始導航");
@@ -376,14 +413,45 @@ async function startRide(opts = {}) {
   R.tick = setInterval(() => { renderRide(); if (R.liveDirty) { R.liveDirty = false; R.lastBetter = 0; } checkBetterRoute(); }, 1000);
   renderRide();
 }
+function initRideLayers() {
+  const m = rideMap, empty = fc([]);
+  for (const id of ["r-route", "r-done", "r-traffic", "r-turn", "r-sig", "r-dest"]) setGeo(m, id, empty);
+  addLayer(m, { id: "r-route-case", type: "line", source: "r-route", layout: ROUND, paint: { "line-color": "#0b4fb3", "line-width": ["interpolate", ["linear"], ["zoom"], 13, 7, 18, 22] } });
+  addLayer(m, { id: "r-route", type: "line", source: "r-route", layout: ROUND, paint: { "line-color": "#2f86ff", "line-width": ["interpolate", ["linear"], ["zoom"], 13, 4.5, 18, 16] } });
+  addLayer(m, { id: "r-traffic", type: "line", source: "r-traffic", layout: ROUND, paint: { "line-color": ["get", "c"], "line-width": ["interpolate", ["linear"], ["zoom"], 13, 3, 18, 9] } });
+  addLayer(m, { id: "r-done", type: "line", source: "r-done", layout: ROUND, paint: { "line-color": "#9aa5ad", "line-width": ["interpolate", ["linear"], ["zoom"], 13, 4.5, 18, 16] } });
+  addLayer(m, { id: "r-turn", type: "line", source: "r-turn", layout: ROUND, paint: { "line-color": "#ffffff", "line-width": ["interpolate", ["linear"], ["zoom"], 13, 2, 18, 6] } });
+  addLayer(m, { id: "r-sig", type: "circle", source: "r-sig", paint: { "circle-radius": ["interpolate", ["linear"], ["zoom"], 13, 4, 18, 11], "circle-color": ["get", "c"], "circle-stroke-color": "#ffffff", "circle-stroke-width": 2.5 } });
+  addLayer(m, { id: "r-sig-label", type: "symbol", source: "r-sig", minzoom: 14.5, layout: { "text-field": ["get", "lab"], "text-font": FONT, "text-size": 13, "text-offset": [0, -1.5], "text-allow-overlap": true, "text-anchor": "bottom" }, paint: { "text-color": ["get", "tc"], "text-halo-color": "#ffffff", "text-halo-width": 2 } });
+  addLayer(m, { id: "r-dest", type: "circle", source: "r-dest", paint: { "circle-radius": 9, "circle-color": "#e5483d", "circle-stroke-color": "#fff", "circle-stroke-width": 3 } });
+}
+function setFollow(on) {
+  R.follow = on;
+  $("rRecenter").hidden = on;
+  $("rOverview").textContent = on ? "概覽" : "導航視角";
+  if (on && R.last) camera(true);
+}
+function camera(jump) {
+  const f = R.last; if (!f || !rideMap) return;
+  const h = rideMap.getContainer().clientHeight;
+  const zoom = f.v < 4 ? 17.6 : f.v < 9 ? 17.1 : 16.6;
+  const opts = { center: [f.lon, f.lat], bearing: R.hdSm == null ? rideMap.getBearing() : R.hdSm, pitch: 52, zoom, padding: { top: Math.round(h * .42), bottom: 90, left: 0, right: 0 } };
+  if (jump) rideMap.jumpTo(opts); else rideMap.easeTo(Object.assign(opts, { duration: 950, easing: t => t }));
+}
+function overview() {
+  if (!R.route) return;
+  setFollow(false);
+  const c = routeCoords(R.route);
+  const b = c.reduce((b, x) => b.extend(x), new maplibregl.LngLatBounds(c[0], c[0]));
+  const h = rideMap.getContainer().clientHeight;
+  rideMap.jumpTo({ pitch: 0, bearing: 0, padding: { top: 0, bottom: 0, left: 0, right: 0 } });
+  rideMap.fitBounds(b, { padding: { top: Math.round(h * .22), bottom: Math.round(h * .3), left: 30, right: 30 }, duration: 600 });
+}
 function drawRideRoute() {
-  const ll = geomLL(R.route);
-  if (rideRoute) rideRoute.remove(); if (rideDone) rideDone.remove();
-  rideRoute = L.polyline(ll, { color: "#3d8cf0", weight: 8, opacity: .95 }).addTo(rideMap);
-  rideDone = L.polyline([], { color: "#6b7780", weight: 8, opacity: .9 }).addTo(rideMap);
-  sigLayer.clearLayers();
-  liveOverlay(R.route, sigLayer, 4);
-  for (const s of R.route.signals) L.marker(llOf(s.x, s.y), { icon: L.divIcon({ className: "", html: `<div class="sigmk" style="background:${sigModel(R.dir, s.id) ? "#2fc26b" : "#9aa3a9"}"></div>`, iconSize: [12, 12] }) }).addTo(sigLayer);
+  if (!rideMap || !rideMap.getSource("r-route")) return;
+  setGeo(rideMap, "r-route", fc([lineF(routeCoords(R.route))]));
+  setGeo(rideMap, "r-traffic", fc(trafficFeatures(R.route)));
+  setGeo(rideMap, "r-dest", fc([ptF([R.destLL.lon, R.destLL.lat])]));
   if (!R.pred) R.pred = routeTime(R.route, 0, R.dir) * calibFactor(R.dir);
 }
 function onGeoErr(e) { $("rGps").textContent = e.code === 1 ? "沒有定位權限：請到 iPhone 設定 › Safari › 位置，允許這個網站" : "GPS 訊號弱，等待定位…"; }
@@ -402,7 +470,12 @@ function onFix(pos) {
   R.aMax = null;
   if (!R.id) { const d0 = new Date(t); R.id = dateStr(d0) + "_" + R.dir + "_" + pad(d0.getHours()) + pad(d0.getMinutes()); }
   if (Date.now() - R.lastSave > 20000) { R.lastSave = Date.now(); DB.put({ id: R.id, pts: R.pts, partial: true }); }
-  // route following & rerouting
+  // smooth the heading the map turns to (only while moving)
+  if (hd != null && v > 1.5) {
+    const deg = hd * 180 / Math.PI;
+    if (R.hdSm == null) R.hdSm = deg;
+    else { let dlt = ((deg - R.hdSm + 540) % 360) - 180; R.hdSm = (R.hdSm + dlt * (v > 6 ? .55 : .35) + 360) % 360; }
+  }
   if (!R.route) reroute(fix, true);
   else {
     const pr = Graph.project(R.route, xy);
@@ -412,6 +485,8 @@ function onFix(pos) {
   }
   detectStops(fix);
   R.last = fix;
+  if (puck) { puck.setLngLat([fix.lon, fix.lat]); if (fix.hd != null) puck.setRotation(fix.hd * 180 / Math.PI); puck.getElement().classList.toggle("nohead", fix.hd == null); }
+  if (R.follow) camera(!last);
   checkArrival(fix);
   renderRide();
 }
@@ -462,73 +537,116 @@ const ARROWS = {
   L: "M34 50V30a6 6 0 0 0-6-6H14m0 0l9-9m-9 9l9 9", R: "M24 50V30a6 6 0 0 1 6-6h14m0 0l-9-9m9 9l-9 9",
   SL: "M36 50V34L20 16m0 0v12m0-12h12", SR: "M22 50V34L38 16m0 0v12m0-12H26", U: "M20 50V24a10 10 0 0 1 20 0v14m0 0l-8-8m8 8l8-8", S: "M29 50V10m0 0l-10 10m10-10l10 10", F: "M29 8a12 12 0 0 1 12 12c0 10-12 26-12 26S17 30 17 20A12 12 0 0 1 29 8z"
 };
-const arrowSvg = k => `<svg viewBox="0 0 58 58"><path d="${ARROWS[k] || ARROWS.S}" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const arrowSvg = (k, w = 6) => `<svg viewBox="0 0 58 58"><path d="${ARROWS[k] || ARROWS.S}" fill="none" stroke="currentColor" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 function fmtDist(m) { return m >= 1000 ? (m / 1000).toFixed(1) + "<small>km</small>" : (m >= 100 ? Math.round(m / 50) * 50 : Math.max(10, Math.round(m / 10) * 10)) + "<small>m</small>"; }
-function advise(s, distM, v) {
+const fmtDistTxt = m => m >= 1000 ? (m / 1000).toFixed(1) + " km" : Math.round(m / 10) * 10 + " m";
+/* predicted light at a signal when you get there */
+function predict(s, distM, v) {
   const period = periodOf(tod());
   const m = sigModel(period, s.id), st = sigStats(period, s.id);
-  if (!m) return { cls: "unk", text: s.name, sub: st ? `號誌未知 · 你在這停過 ${st.n} 次，平均 ${Math.round(st.avg)} 秒` : "號誌未知 · 停下時會自動學習" };
-  const lt = distM > 150 ? Graph.timeAlong(R.route, R.d, R.d + distM) : null;
+  if (!m) return { state: "unk", st, m: null };
+  const lt = distM > 150 && R.route ? Graph.timeAlong(R.route, R.d, R.d + distM) : null;
   const tArr = tod() + (lt != null ? lt : distM / Math.max(v, 4));
-  const Lt = lightAt(m, tArr);
+  const Lt = lightAt(m, tArr), now = lightAt(m, tod());
   const conf = m.src === "manual" ? "手動設定" : `已學習 ${m.n} 次`;
-  if (Lt.green && Lt.left >= 3) return { cls: "go", text: "綠燈可過，保持", sub: `${s.name} · 抵達時還剩約 ${Math.round(Lt.left)} 秒 · ${conf}`, state: "go" };
-  if (Lt.green) return { cls: "slow", text: "抵達時剛好轉黃", sub: `${s.name} · 準備停車 · ${conf}`, state: "stop" };
+  if (Lt.green && Lt.left >= 3) return { state: "go", left: Lt.left, now, m, conf };
+  if (Lt.green) return { state: "amber", now, m, conf };
   const tg = tArr + Lt.wait - tod(), vNeed = distM / tg * 3.6;
-  if (vNeed >= 15 && distM > 60) return { cls: "slow", text: `收油到 ${Math.round(vNeed)} km/h 免停`, sub: `${s.name} · 抵達時剛好轉綠 · ${conf}`, state: "slow", v: Math.round(vNeed) };
-  return { cls: "stop", text: `紅燈，約等 ${Math.round(Lt.wait)} 秒`, sub: `${s.name} · ${conf}`, state: "stop" };
+  if (vNeed >= 15 && distM > 60) return { state: "slow", v: Math.round(vNeed), wait: Lt.wait, now, m, conf };
+  return { state: "stop", wait: Lt.wait, now, m, conf };
+}
+const STATE_COLOR = { go: "#22b35e", amber: "#f2a33a", slow: "#f2a33a", stop: "#e5483d", unk: "#8a949b" };
+function sigLabel(p) {
+  if (p.state === "go") return "綠";
+  if (p.state === "amber") return "黃";
+  if (p.state === "slow") return `收油 ${p.v}`;
+  if (p.state === "stop") return `紅 ${Math.round(p.wait)}s`;
+  return p.st ? `均 ${Math.round(p.st.avg)}s` : "";
+}
+function ring(frac, color) {
+  const r = 22, c = 2 * Math.PI * r;
+  return `<svg viewBox="0 0 54 54" class="ring"><circle cx="27" cy="27" r="${r}" stroke="rgba(127,127,127,.25)" stroke-width="6" fill="none"/><circle cx="27" cy="27" r="${r}" stroke="${color}" stroke-width="6" fill="none" stroke-linecap="round" stroke-dasharray="${(c * Math.max(0, Math.min(1, frac))).toFixed(1)} ${c.toFixed(1)}" transform="rotate(-90 27 27)"/></svg>`;
 }
 function renderRide() {
   if (!R.on) return;
   const f = R.last;
-  if (!f) { $("rGps").textContent = "等待 GPS 定位…"; return; }
-  $("rGps").textContent = `GPS ±${Math.round(f.acc)} m · ${R.pts.length} 點${R.stopsLog.length ? " · 停 " + R.stopsLog.length + " 次" : ""}${R.reroutes ? " · 重新規劃 " + R.reroutes + " 次" : ""}`;
+  if (!f) { $("rGps").textContent = "等待 GPS 定位…"; $("rManRoad").textContent = "等待 GPS 定位"; return; }
+  $("rGps").textContent = `GPS ±${Math.round(f.acc)} m · 已記錄 ${R.pts.length} 點${R.stopsLog.length ? " · 停 " + R.stopsLog.length + " 次" : ""}${R.reroutes ? " · 重新規劃 " + R.reroutes + " 次" : ""}`;
   $("rSpeed").textContent = Math.round(f.v * 3.6);
   $("rStamp").disabled = !(f.v < 1);
-  const ll = [f.lat, f.lon];
-  const deg = f.hd == null ? 0 : f.hd * 180 / Math.PI;
-  const html = f.hd == null ? '<div class="me nohead"><i></i></div>' : `<div class="me" style="transform:rotate(${deg}deg)"><i></i></div>`;
-  if (!meMk) meMk = L.marker(ll, { icon: L.divIcon({ className: "", html, iconSize: [26, 26] }), zIndexOffset: 1000 }).addTo(rideMap);
-  else { meMk.setLatLng(ll); meMk.setIcon(L.divIcon({ className: "", html, iconSize: [26, 26] })); }
-  if (R.follow) rideMap.setView(ll, Math.max(rideMap.getZoom() || 17, 16), { animate: false });
   if (!R.route) { $("rManDist").innerHTML = "—"; $("rManRoad").textContent = "規劃路線中…"; return; }
-  // traveled part
-  if (rideDone) rideDone.setLatLngs(R.route.geom.filter(p => p[2] <= R.d).map(p => llOf(p[0], p[1])).concat([ll]));
   const r = R.route, d = R.d || 0;
+  // traveled part + next turn highlight on the map
+  if (rideMap && rideMap.getSource("r-done")) {
+    setGeo(rideMap, "r-done", fc([lineF(r.geom.filter(p => p[2] <= d).map(p => lngLat(p[0], p[1])).concat([[f.lon, f.lat]]))]));
+  }
+  // maneuver banner
   const man = $("rMan");
   man.classList.toggle("off", R.off >= 2);
-  const t = r.turns.find(x => x.d > d + 3);
+  const turns = r.turns.filter(x => x.d > d + 3);
+  const t = turns[0], t2 = turns[1];
   const remainM = Math.max(0, r.distance - d);
-  if (R.off >= 2) { $("rManIcon").innerHTML = arrowSvg("S"); $("rManDist").innerHTML = "偏離中"; $("rManRoad").textContent = "依你走的路重新規劃…"; }
-  else if (t && t.d - d < 2000) {
+  let turnSeg = [];
+  if (R.off >= 2) { $("rManIcon").innerHTML = arrowSvg("S"); $("rManDist").innerHTML = "偏離路線"; $("rManRoad").textContent = "依你走的路重新規劃…"; $("rThen").innerHTML = ""; }
+  else if (t && t.d - d < 2500) {
     const dist = t.d - d;
     $("rManIcon").innerHTML = arrowSvg(t.dir);
     $("rManDist").innerHTML = fmtDist(dist);
-    $("rManRoad").textContent = turnWord(t.dir) + " " + t.onto;
+    $("rManRoad").textContent = turnWord(t.dir) + "  " + t.onto;
+    $("rThen").innerHTML = t2 && t2.d - t.d < 300 ? `<span class="then-ico">${arrowSvg(t2.dir, 7)}</span>接著${turnWord(t2.dir)} ${esc(t2.onto)}` : "";
     if (dist < 320 && dist > 150) speak(`${Math.round(dist / 50) * 50}公尺後${turnWord(t.dir)}，${t.onto}`, "t1" + t.d);
     if (dist < 70) speak(`${turnWord(t.dir)}，${t.onto}`, "t2" + t.d);
-  } else if (remainM < 150) { $("rManIcon").innerHTML = arrowSvg("F"); $("rManDist").innerHTML = fmtDist(remainM); $("rManRoad").textContent = "快到了"; }
+    turnSeg = r.geom.filter(p => p[2] >= t.d - 30 && p[2] <= t.d + 30).map(p => lngLat(p[0], p[1]));
+  } else if (remainM < 150) { $("rManIcon").innerHTML = arrowSvg("F"); $("rManDist").innerHTML = fmtDist(remainM); $("rManRoad").textContent = "快到了"; $("rThen").innerHTML = ""; }
   else {
     const seg = r.segs.find(s => s.to > d) || r.segs[r.segs.length - 1];
-    $("rManIcon").innerHTML = arrowSvg("S"); $("rManDist").innerHTML = fmtDist(t ? t.d - d : remainM); $("rManRoad").textContent = "沿 " + (seg ? seg.name : "") + " 直行";
+    $("rManIcon").innerHTML = arrowSvg("S"); $("rManDist").innerHTML = fmtDist(t ? t.d - d : remainM); $("rManRoad").textContent = "沿 " + (seg ? seg.name : "") + " 直行"; $("rThen").innerHTML = "";
   }
-  // next signal
-  const s = r.signals.find(x => x.d > d + 8);
-  const chip = $("rSig");
-  if (s && s.d - d < 700 && R.off < 2) {
-    const dist = s.d - d, a = advise(s, dist, f.v);
-    chip.className = "sigchip " + (a.state === "go" ? "green" : a.state === "stop" ? "red" : a.state === "slow" ? "slow" : "");
-    chip.innerHTML = `<div class="a"><span class="num">${Math.round(dist / 10) * 10} m</span> <span class="adv-${a.cls}">${esc(a.text)}</span></div><div class="b">${esc(a.sub)}</div>`;
-    if (a.state && dist < 260 && dist > 110) speak(a.state === "go" ? "前方綠燈，保持" : a.state === "slow" ? `前方紅燈，收油到 ${a.v}` : "前方紅燈", "s" + s.id + a.state);
-  } else { chip.className = "sigchip"; chip.innerHTML = ""; }
-  // ETA
+  if (rideMap && rideMap.getSource("r-turn")) setGeo(rideMap, "r-turn", fc(turnSeg.length > 1 ? [lineF(turnSeg)] : []));
+  // signals ahead: map labels, the next-signal card and the 3-signal rail
+  const ahead = r.signals.filter(x => x.d > d + 8 && x.d - d < 2000);
+  const preds = ahead.map(s => ({ s, dist: s.d - d, p: predict(s, s.d - d, f.v) }));
+  if (rideMap && rideMap.getSource("r-sig")) setGeo(rideMap, "r-sig", fc(preds.map(({ s, p }) => ptF(lngLat(s.x, s.y), { c: STATE_COLOR[p.state], tc: p.state === "unk" ? "#4a535a" : STATE_COLOR[p.state], lab: sigLabel(p), name: s.name }))));
+  const card = $("rSig");
+  const first = preds[0];
+  if (first && first.dist < 800 && R.off < 2) {
+    const { s, dist, p } = first;
+    let big, sub, ringHtml = "";
+    if (p.state === "unk") { big = "號誌未知"; sub = p.st ? `你在這停過 ${p.st.n} 次，平均 ${Math.round(p.st.avg)} 秒` : "停下時會自動學習週期"; }
+    else {
+      big = p.state === "go" ? "綠燈可過" : p.state === "amber" ? "到時轉黃，準備停" : p.state === "slow" ? `收油到 ${p.v} 免停` : `紅燈 約等 ${Math.round(p.wait)} 秒`;
+      const nowTxt = p.now.green ? `現在綠燈 剩 ${Math.round(p.now.left)} 秒` : `現在紅燈 剩 ${Math.round(p.now.wait)} 秒`;
+      sub = `${nowTxt} · ${p.conf}`;
+      const frac = p.now.green ? p.now.left / p.m.green : p.now.wait / (p.m.cycle - p.m.green);
+      ringHtml = `<div class="ring-box">${ring(frac, p.now.green ? "#22b35e" : "#e5483d")}<span class="num">${Math.round(p.now.green ? p.now.left : p.now.wait)}</span></div>`;
+    }
+    card.className = "sigcard " + p.state;
+    card.innerHTML = `${ringHtml}<div class="sc-body"><div class="sc-top"><span class="num sc-dist">${fmtDistTxt(dist)}</span><span class="sc-name">${esc(s.name)}</span></div><div class="sc-big">${esc(big)}</div><div class="sc-sub">${esc(sub)}</div></div>`;
+    if (p.state !== "unk" && dist < 260 && dist > 110) speak(p.state === "go" ? "前方綠燈，保持" : p.state === "slow" ? `前方紅燈，收油到 ${p.v}` : "前方紅燈", "s" + s.id + p.state);
+  } else { card.className = "sigcard empty"; card.innerHTML = ""; }
+  $("rRail").innerHTML = preds.slice(first && first.dist < 800 ? 1 : 0, 4).map(({ s, dist, p }) => `<div class="rail-i"><i style="background:${STATE_COLOR[p.state]}"></i><span class="num">${fmtDistTxt(dist)}</span><b>${esc(sigLabel(p) || "—")}</b></div>`).join("");
+  // ETA, deadline, vs usual, what lies ahead
   const rem = routeTime(r, d, R.dir) * calibFactor(R.dir);
   const arr = tod() + rem;
-  let late = "";
-  const dl = parseClock(S.settings.deadline) || 32400;
-  if (R.dir === "am" && tod() > dl - 4 * 3600 && tod() < dl + 3600) late = arr > dl ? ` <span class="pill late">晚 ${Math.ceil((arr - dl) / 60)} 分</span>` : ' <span class="pill ok">準時</span>';
-  $("rEta").innerHTML = clock(arr) + late;
+  $("rEta").textContent = clock(arr);
   $("rRemain").textContent = `剩 ${(remainM / 1000).toFixed(1)} km · ${mins(rem)} 分`;
+  const pills = [];
+  const dl = parseClock(S.settings.deadline) || 32400;
+  if (R.dir === "am" && tod() > dl - 4 * 3600 && tod() < dl + 3600) pills.push(arr > dl ? `<span class="pill late">晚 ${Math.ceil((arr - dl) / 60)} 分到</span>` : `<span class="pill ok">${S.settings.deadline} 前到</span>`);
+  const usual = S.trips.filter(x => x.dir === R.dir && x.duration > 300).map(x => x.duration);
+  if (usual.length >= 3) {
+    const delta = median(usual) - ((Date.now() - R.startT) / 1000 + rem);
+    if (Math.abs(delta) >= 30) pills.push(`<span class="pill ${delta > 0 ? "ok" : "warn"}">比平常${delta > 0 ? "快" : "慢"} ${mmss(Math.abs(delta))}</span>`);
+  }
+  $("rStatus").innerHTML = pills.join("");
+  const sigLeft = r.signals.filter(x => x.d > d + 8);
+  const waitLeft = sigLeft.reduce((a, s) => a + sigDelay(s, periodOf(tod())), 0);
+  const info = [`<span>前方 <b class="num">${sigLeft.length}</b> 個號誌，預估等 <b class="num">${mmss(waitLeft)}</b></span>`];
+  let jam = null, jamLen = 0;
+  for (const e of r.edges) { if (e.to <= d || e.from - d > 3000) continue; const mo = G.moe[e.de]; if (mo >= 1) { if (!jam) jam = { from: Math.max(0, e.from - d), mo, name: Graph.shortName(Graph.nameOf(Graph.deE(e.de))) }; jamLen += e.to - Math.max(e.from, d); jam.mo = Math.max(jam.mo, mo); } else if (jam) break; }
+  if (jam) info.push(`<span class="${jam.mo >= 2 ? "t-jam" : "t-slow"}">${jam.from < 30 ? "目前" : fmtDistTxt(jam.from) + " 後"}${jam.mo >= 2 ? "壅塞" : "車流較慢"} ${fmtDistTxt(jamLen)}${jam.name ? "（" + esc(jam.name) + "）" : ""}</span>`);
+  else if (LIVE.n) info.push('<span class="t-ok">前方 3 km 即時路況順暢</span>');
+  $("rInfo").innerHTML = info.join("");
 }
 function stampGreen() {
   const f = R.last; if (!f) return;
@@ -539,6 +657,7 @@ function stampGreen() {
   toast("已記錄：" + Graph.sigNameById(sg.id) + " 綠燈亮");
   R.stopStart = null;
 }
+
 async function finishRide(auto) {
   if (!R.on) return;
   R.on = false; clearInterval(R.tick);
@@ -667,7 +786,7 @@ function renderRecords() {
 }
 
 /* ---------------- trip detail ---------------- */
-let tripMap, tripLayer;
+let tripMap;
 const SPEED_BINS = [[0, 10, "#e5483d", "< 10"], [10, 20, "#f08a24", "10–20"], [20, 30, "#e6c229", "20–30"], [30, 45, "#5cc45a", "30–45"], [45, 999, "#2f8cff", "45 以上"]];
 const binOf = kmh => SPEED_BINS.findIndex(b => kmh >= b[0] && kmh < b[1]);
 async function openTrip(id) {
@@ -676,13 +795,21 @@ async function openTrip(id) {
   $("tEyebrow").textContent = `${t.date} · ${DIRNAME[t.dir]}`;
   $("tTitle").textContent = `${clock(t.depart)} → ${clock(t.arrive)}`;
   const tr = t.hasTrack ? await DB.get(id) : null;
-  if (!tripMap) { tripMap = mkMap("tripMap", { zoomControl: true }); tripLayer = L.layerGroup().addTo(tripMap); }
-  tripLayer.clearLayers(); tripMap.invalidateSize();
+  if (!tripMap) {
+    tripMap = mkMap("tripMap", { zoomCtl: true });
+    tripMap.on("click", "t-stop", e => { const p = e.features[0].properties; new maplibregl.Popup({ offset: 12 }).setLngLat(e.lngLat).setHTML(`${esc(p.name)}<br>${p.time} 停 ${p.wait} 秒`).addTo(tripMap); });
+  }
+  await tripMap.ready; tripMap.resize();
+  for (const id of ["t-track", "t-stop"]) setGeo(tripMap, id, fc([]));
+  addLayer(tripMap, { id: "t-track-case", type: "line", source: "t-track", layout: ROUND, paint: { "line-color": "#ffffff", "line-width": 8 } });
+  addLayer(tripMap, { id: "t-track", type: "line", source: "t-track", layout: ROUND, paint: { "line-color": ["get", "c"], "line-width": 5 } });
+  addLayer(tripMap, { id: "t-stop", type: "circle", source: "t-stop", paint: { "circle-radius": ["get", "r"], "circle-color": "rgba(229,72,61,.9)", "circle-stroke-color": "#fff", "circle-stroke-width": 2 } });
+  addLayer(tripMap, { id: "t-stop-label", type: "symbol", source: "t-stop", layout: { "text-field": ["get", "wait"], "text-font": FONT, "text-size": 11, "text-allow-overlap": true }, paint: { "text-color": "#ffffff" } });
   if (!tr || !tr.pts || tr.pts.length < 5) {
     $("tStats").innerHTML = stat(mins(t.duration) + " 分", "門到門時間") + stat(clock(t.depart), "出發") + stat(clock(t.arrive), "抵達");
     $("tChart").innerHTML = '<p class="note">這趟來自 Google 時間軸，只有出發和抵達時間。用導航錄的趟次才有詳細軌跡。</p>';
     $("tStops").innerHTML = $("tRoads").innerHTML = $("tLegend").innerHTML = "";
-    tripMap.setView([25.02, 121.525], 13);
+    tripMap.jumpTo({ center: [121.525, 25.022], zoom: 12.5 });
     tripActions(t, null); return;
   }
   const a = analyzeTrack(tr.pts);
@@ -691,19 +818,16 @@ async function openTrip(id) {
     + stat(mmss(a.stopped), "停止時間") + stat(a.stops.length + " 次", "停下次數") + stat((a.moving ? a.dist / a.moving * 3.6 : 0).toFixed(1), "行駛均速 km/h")
     + stat((a.dist / t.duration * 3.6).toFixed(1), "全程均速 km/h") + stat(Math.round(a.vmax * 3.6), "最高速 km/h") + stat(pts.length, "GPS 點數");
   // track colored by speed
-  let seg = [], bin = -1;
+  const feats = []; let seg = [], bin = -1;
   for (let i = 0; i < pts.length; i++) {
-    const b = binOf((pts[i][3] || 0) * 3.6), ll = [pts[i][1], pts[i][2]];
-    if (b !== bin && seg.length) { seg.push(ll); L.polyline(seg, { color: SPEED_BINS[bin][2], weight: 6, opacity: .95 }).addTo(tripLayer); seg = []; }
+    const b = binOf((pts[i][3] || 0) * 3.6), ll = [pts[i][2], pts[i][1]];
+    if (b !== bin && seg.length) { seg.push(ll); feats.push(lineF(seg, { c: SPEED_BINS[bin][2] })); seg = []; }
     bin = b; seg.push(ll);
   }
-  if (seg.length > 1) L.polyline(seg, { color: SPEED_BINS[bin][2], weight: 6 }).addTo(tripLayer);
-  for (const s of a.stops) {
-    const r = Math.min(34, 18 + s.wait / 6);
-    L.marker([s.lat, s.lon], { icon: L.divIcon({ className: "", html: `<div class="stopmk" style="width:${r}px;height:${r}px">${s.wait}</div>`, iconSize: [r, r] }) })
-      .bindPopup(`${esc(s.name || "非號誌處")}<br>${clock(tod(new Date(s.t)), true)} 停 ${s.wait} 秒`).addTo(tripLayer);
-  }
-  tripMap.fitBounds(L.latLngBounds(pts.map(p => [p[1], p[2]])).pad(.08));
+  if (seg.length > 1) feats.push(lineF(seg, { c: SPEED_BINS[bin][2] }));
+  setGeo(tripMap, "t-track", fc(feats));
+  setGeo(tripMap, "t-stop", fc(a.stops.map(s => ptF([s.lon, s.lat], { r: Math.min(17, 9 + s.wait / 12), wait: String(s.wait), name: s.name || "非號誌處", time: clock(tod(new Date(s.t)), true) }))));
+  fitTo(tripMap, pts.map(p => [p[2], p[1]]), 30);
   $("tLegend").innerHTML = SPEED_BINS.map(b => `<span><i style="background:${b[2]}"></i>${b[3]} km/h</span>`).join("") + '<span>紅圈數字＝停等秒數</span>';
   $("tChart").innerHTML = speedChart(pts, a.stops);
   $("tStops").innerHTML = a.stops.length ? `<table><thead><tr><th>時刻</th><th>地點</th><th class="r">停</th></tr></thead><tbody>${a.stops.map(s => `<tr><td class="num">${clock(tod(new Date(s.t)), true)}</td><td>${esc(s.name || "非號誌處（塞車或路邊）")}</td><td class="r num">${s.wait} 秒</td></tr>`).join("")}</tbody></table>
@@ -738,33 +862,32 @@ function tripActions(t, tr) {
 
 /* ---------------- home / office picker ---------------- */
 let pickMap, pickMk = {}, pickWhich = "home", pickTmp = {};
-function openPicker() {
+async function openPicker() {
   pickTmp = { home: S.settings.home, office: S.settings.office };
   show("pick");
   if (!pickMap) {
-    pickMap = mkMap("pickMap", { zoomControl: true });
-    pickMap.on("click", e => setPick(pickWhich, e.latlng.lat, e.latlng.lng));
+    pickMap = mkMap("pickMap", { zoomCtl: true });
+    pickMap.on("click", e => setPick(pickWhich, e.lngLat.lat, e.lngLat.lng));
   }
-  pickMap.invalidateSize();
+  await pickMap.ready; pickMap.resize();
   for (const k of ["home", "office"]) { if (pickMk[k]) { pickMk[k].remove(); pickMk[k] = null; } if (pickTmp[k]) setPick(k, pickTmp[k].lat, pickTmp[k].lon, true); }
-  const pts = ["home", "office"].filter(k => pickTmp[k]).map(k => [pickTmp[k].lat, pickTmp[k].lon]);
-  if (pts.length === 2) pickMap.fitBounds(pts, { padding: [40, 40] }); else if (pts.length) pickMap.setView(pts[0], 16); else pickMap.setView([25.022, 121.525], 13);
+  const pts = ["home", "office"].filter(k => pickTmp[k]).map(k => [pickTmp[k].lon, pickTmp[k].lat]);
+  if (pts.length === 2) fitTo(pickMap, pts, 60); else if (pts.length) pickMap.jumpTo({ center: pts[0], zoom: 16 }); else pickMap.jumpTo({ center: [121.525, 25.022], zoom: 13 });
   setWhich(pickTmp.home ? (pickTmp.office ? "home" : "office") : "home");
 }
 function setWhich(k) { pickWhich = k; $("pkHome").setAttribute("aria-pressed", k === "home"); $("pkOffice").setAttribute("aria-pressed", k === "office"); $("pkMsg").textContent = `點地圖放置「${k === "home" ? "家" : "公司"}」，或拖曳圖釘微調。`; }
 function setPick(k, lat, lon, quiet) {
   const xy = Graph.toXY(lat, lon);
-  const near = Graph.nearEdges(xy[0], xy[1], 200, null);
-  if (!near.length) { toast("這個位置離可騎的道路太遠，或超出路網範圍（永和到中山區）"); return; }
+  if (!Graph.nearEdges(xy[0], xy[1], 200, null).length) { toast("這個位置離可騎的道路太遠，或超出路網範圍（永和到中山區）"); if (pickMk[k] && pickTmp[k]) pickMk[k].setLngLat([pickTmp[k].lon, pickTmp[k].lat]); return; }
   pickTmp[k] = { lat, lon };
-  if (pickMk[k]) pickMk[k].setLatLng([lat, lon]);
-  else { pickMk[k] = L.marker([lat, lon], { icon: pinIcon(k), draggable: true }).addTo(pickMap); pickMk[k].on("dragend", e => { const p = e.target.getLatLng(); setPick(k, p.lat, p.lng, true); }); }
+  if (pickMk[k]) pickMk[k].setLngLat([lon, lat]);
+  else { pickMk[k] = new maplibregl.Marker({ element: pinEl(k), anchor: "bottom", draggable: true }).setLngLat([lon, lat]).addTo(pickMap); pickMk[k].on("dragend", () => { const p = pickMk[k].getLngLat(); setPick(k, p.lat, p.lng, true); }); }
   if (!quiet && k === "home" && !pickTmp.office) setWhich("office");
 }
 function pickHere() {
   if (!("geolocation" in navigator)) return;
   $("pkMsg").textContent = "定位中…";
-  navigator.geolocation.getCurrentPosition(p => { setPick(pickWhich, p.coords.latitude, p.coords.longitude); pickMap.setView([p.coords.latitude, p.coords.longitude], 17); $("pkMsg").textContent = "已放到目前位置，可拖曳微調"; },
+  navigator.geolocation.getCurrentPosition(p => { setPick(pickWhich, p.coords.latitude, p.coords.longitude); pickMap.jumpTo({ center: [p.coords.longitude, p.coords.latitude], zoom: 17 }); $("pkMsg").textContent = "已放到目前位置，可拖曳微調"; },
     e => { $("pkMsg").textContent = e.code === 1 ? "沒有定位權限" : "定位失敗"; }, { enableHighAccuracy: true, timeout: 20000 });
 }
 
@@ -851,7 +974,7 @@ function show(v) {
   const tab = { plan: "plan", sig: "sig", set: "set", pick: "set", trip: "set" }[v];
   document.querySelectorAll("#tabs button").forEach(b => { if (b.dataset.v === tab) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
   if (v !== "ride") window.scrollTo(0, 0);
-  if (v === "plan" && planMap) setTimeout(() => planMap.invalidateSize(), 50);
+  if (v === "plan" && planMap) setTimeout(() => planMap.resize(), 50);
 }
 function renderAll() { renderPlan(); renderSignals(); renderRecords(); }
 
@@ -864,7 +987,8 @@ async function boot() {
   $("dAm").onclick = () => { S.dir = "am"; renderPlan(); }; $("dPm").onclick = () => { S.dir = "pm"; renderPlan(); };
   $("sAm").onclick = () => { S.sigPeriod = "am"; S.editSig = null; renderSignals(); }; $("sPm").onclick = () => { S.sigPeriod = "pm"; S.editSig = null; renderSignals(); };
   $("startBtn").onclick = () => startRide(); $("rStop").onclick = () => finishRide(false); $("rStamp").onclick = stampGreen;
-  $("rRecenter").onclick = () => { R.follow = true; if (R.last) rideMap.setView([R.last.lat, R.last.lon], 17); };
+  $("rRecenter").onclick = () => setFollow(true);
+  $("rOverview").onclick = () => { if (R.follow) overview(); else setFollow(true); };
   document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => { show(b.dataset.v); if (b.dataset.v === "sig") renderSignals(); if (b.dataset.v === "set") renderRecords(); });
   $("obSet").onclick = openPicker; $("openPicker").onclick = openPicker;
   $("pkHome").onclick = () => setWhich("home"); $("pkOffice").onclick = () => setWhich("office"); $("pkHere").onclick = pickHere;

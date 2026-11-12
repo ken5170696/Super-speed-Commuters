@@ -31,6 +31,7 @@
       <p class="note">在地圖上點選你家和公司的位置，路線就能從家門口算到公司門口。位置只存在這支手機。</p>
       <button class="big go" id="obSet">在地圖上設定</button>
     </div>
+    <div class="chips" id="placeChips"></div>
     <div class="card hero" id="planHero"></div>
     <div class="mapbox plan-map"><div id="planMap" class="map"></div></div>
     <div class="list" id="planRoutes"></div>
@@ -86,9 +87,9 @@
     <header class="bar"><div><div class="eyebrow">資料只存在這支手機</div><h1>紀錄</h1></div></header>
     <div class="card"><h2>通勤紀錄</h2><div id="tripStats"></div><div class="list" id="tripList"></div></div>
     <div class="card">
-      <h2>家與公司</h2>
+      <h2>我的地點</h2>
       <p class="small" id="placeVal"></p>
-      <div class="row wrap"><button class="btn" id="openPicker">在地圖上設定</button></div>
+      <div class="row wrap"><button class="btn" id="openPicker">設定家、公司、車庫等地點</button></div>
     </div>
     <div class="card">
       <h2>資料</h2>
@@ -112,9 +113,11 @@
 
   <!-- 家與公司地圖選點 -->
   <section class="view" id="v-pick" hidden>
-    <header class="bar"><div><div class="eyebrow">點地圖或拖曳圖釘</div><h1>家與公司</h1></div></header>
-    <div class="seg wide" role="group" aria-label="要設定的地點">
-      <button id="pkHome" aria-pressed="true">設定「家」</button><button id="pkOffice" aria-pressed="false">設定「公司」</button>
+    <header class="bar"><div><div class="eyebrow">點地圖或拖曳圖釘</div><h1>我的地點</h1></div></header>
+    <div class="seg wide scroll" role="group" aria-label="要設定的地點" id="pkSeg"></div>
+    <div class="row wrap" id="pkNameRow" hidden>
+      <label class="small" for="pkName">地點名稱</label><input id="pkName" type="text" maxlength="12" placeholder="例如：車庫">
+      <button class="btn danger" id="pkDel">刪除這個地點</button>
     </div>
     <div class="mapbox pick-map"><div id="pickMap" class="map"></div></div>
     <div class="row wrap"><button class="btn" id="pkHere">用目前位置</button><span class="small" id="pkMsg"></span></div>

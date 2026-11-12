@@ -33,6 +33,7 @@ const S = {
   plan: { am: null, pm: null }, sel: { am: 0, pm: 0 },
   sigPeriod: new Date().getHours() < 13 ? "am" : "pm",
   passes: {}, learned: 0,
+  endpoint: load("endpoint", { am: null, pm: null }),
 };
 function saveSettings() { save("settings", S.settings); }
 function saveTrips() { save("trips", S.trips); }
@@ -236,7 +237,41 @@ function calibFactor(dir) {
   const f = S.trips.filter(t => t.dir === dir && t.pred && t.duration > 300).map(t => t.duration / t.pred);
   return f.length >= 3 ? Math.max(.7, Math.min(1.5, median(f))) : 1;
 }
-function placeOf(dir, end) { return (dir === "am") === (end === "from") ? S.settings.home : S.settings.office; }
+/* ---------- places: home, office and any extra spots (garage, a friend's shop…) ---------- */
+function allPlaces() {
+  const out = [];
+  if (S.settings.home) out.push(Object.assign({ id: "home", name: "家" }, S.settings.home));
+  if (S.settings.office) out.push(Object.assign({ id: "office", name: "公司" }, S.settings.office));
+  for (const p of S.settings.places || []) if (p.lat != null) out.push(p);
+  return out;
+}
+const sidePlaces = () => allPlaces().filter(p => p.id !== "office");
+const placeById = id => allPlaces().find(p => p.id === id) || null;
+const placeName = id => { const p = placeById(id); return p ? p.name : ""; };
+function nearestPlace(lat, lon, maxD) {
+  const xy = Graph.toXY(lat, lon); let best = null;
+  for (const p of allPlaces()) { const q = xyOf(p), d = Math.hypot(q[0] - xy[0], q[1] - xy[1]); if (d <= maxD && (!best || d < best.d)) best = { id: p.id, d }; }
+  return best ? best.id : null;
+}
+function autoEndpoint(dir) {
+  // the place you most often leave from (mornings) or ride to (evenings) on this weekday
+  const wd = new Date().getDay(), key = dir === "am" ? "from" : "to", cnt = {};
+  for (const t of S.trips.slice(-80)) { if (t.dir !== dir || !t[key] || t[key] === "office") continue; const w = new Date(t.date + "T12:00:00").getDay(); cnt[t[key]] = (cnt[t[key]] || 0) + (w === wd ? 2 : 1); }
+  const best = Object.entries(cnt).filter(([id]) => placeById(id)).sort((a, b) => b[1] - a[1])[0];
+  return best ? best[0] : "home";
+}
+function endpointId(dir) { const id = S.endpoint[dir]; return id && placeById(id) ? id : autoEndpoint(dir); }
+function placeOf(dir, end) {
+  if (dir === "am") return end === "from" ? placeById(endpointId("am")) : S.settings.office;
+  return end === "from" ? S.settings.office : placeById(endpointId("pm"));
+}
+function tripsLike(dir) {
+  // trips in this direction, to/from the currently selected place when there are enough of them
+  const all = S.trips.filter(t => t.dir === dir && t.duration > 300);
+  const key = dir === "am" ? "from" : "to", id = endpointId(dir);
+  const same = all.filter(t => (t[key] || "home") === id);
+  return same.length >= 3 ? { list: same, scoped: true } : { list: id === "home" ? all : same, scoped: id !== "home" };
+}
 function computePlan(dir) {
   const A = placeOf(dir, "from"), B = placeOf(dir, "to");
   if (!A || !B) return [];
@@ -328,6 +363,12 @@ async function renderPlanMap(plan) {
 
 
 /* ---------------- plan view ---------------- */
+function renderChips() {
+  const id = endpointId(S.dir), auto = !S.endpoint[S.dir];
+  $("placeChips").innerHTML = `<span class="chips-k">${S.dir === "am" ? "從" : "回到"}</span>` + sidePlaces().map(p => `<button class="chip" data-id="${esc(p.id)}" aria-pressed="${p.id === id}">${esc(p.name)}${p.id === id && auto ? '<small>常去</small>' : ""}</button>`).join("") + '<button class="chip add" id="chipAdd">＋ 地點</button>';
+  $("placeChips").querySelectorAll(".chip[data-id]").forEach(b => b.onclick = () => { S.endpoint[S.dir] = b.dataset.id; save("endpoint", S.endpoint); S.plan[S.dir] = null; S.sel[S.dir] = 0; renderPlan(); });
+  $("chipAdd").onclick = () => openPicker("new");
+}
 function renderPlan() {
   $("dAm").setAttribute("aria-pressed", S.dir === "am"); $("dPm").setAttribute("aria-pressed", S.dir === "pm");
   const ready = S.settings.home && S.settings.office;
@@ -336,14 +377,15 @@ function renderPlan() {
   $("optAuto").checked = !!S.settings.auto;
   if (!ready) { $("planHero").hidden = true; $("planRoutes").innerHTML = ""; $("planNote").textContent = ""; renderPlanMap([]); return; }
   $("planHero").hidden = false;
+  renderChips();
   const plan = S.plan[S.dir] || (S.plan[S.dir] = computePlan(S.dir));
   if (S.sel[S.dir] >= plan.length) S.sel[S.dir] = 0;
   const cur = plan[S.sel[S.dir]];
   if (!cur) { $("planHero").innerHTML = "<p>找不到路線，請確認家和公司的位置在永和到中山區之間的道路旁。</p>"; return; }
   const now = tod(), arrive = now + cur.sec;
-  const ts = S.trips.filter(t => t.dir === S.dir && t.duration > 300).map(t => t.duration);
+  const like = tripsLike(S.dir), ts = like.list.map(t => t.duration);
   let extra = "";
-  if (ts.length) extra += `<div class="line">你過去 ${ts.length} 趟的中位數 <b class="num">${mins(median(ts))}</b> 分鐘</div>`;
+  if (ts.length) extra += `<div class="line">你過去${like.scoped ? (S.dir === "am" ? "從「" : "到「") + esc(placeName(endpointId(S.dir))) + "」" : ""} ${ts.length} 趟的中位數 <b class="num">${mins(median(ts))}</b> 分鐘</div>`;
   if (S.dir === "am") {
     const dl = parseClock(S.settings.deadline) || 32400;
     if (now < dl + 1800) {
@@ -385,10 +427,11 @@ async function startRide(opts = {}) {
   const dir = opts.dir || S.dir;
   const dest = placeOf(dir, "to");
   if (!dest) { toast("請先設定家和公司"); return; }
+  const fromP = placeOf(dir, "from");
   const plan = S.plan[dir] || computePlan(dir);
   const chosen = opts.auto ? null : plan[S.sel[dir]];
   stopPassive();
-  Object.assign(R, { on: true, dir, dest: xyOf(dest), destLL: dest, route: chosen ? chosen.r : null, pts: [], said: {}, off: 0, lastReroute: 0, follow: true, stopStart: null, stopsLog: [], aMax: null, startT: Date.now(), id: null, pred: null, arriveT: null, lastSave: 0, reroutes: 0, hdSm: null, last: null, d: 0 });
+  Object.assign(R, { on: true, dir, dest: xyOf(dest), destLL: dest, destId: dir === "am" ? "office" : endpointId("pm"), fromId: opts.fromId || (fromP && fromP.id) || null, arrivedId: null, route: chosen ? chosen.r : null, pts: [], said: {}, off: 0, lastReroute: 0, follow: true, stopStart: null, stopsLog: [], aMax: null, startT: Date.now(), id: null, pred: null, arriveT: null, lastSave: 0, reroutes: 0, hdSm: null, last: null, d: 0 });
   if (S.settings.motion && window.DeviceMotionEvent) {
     try { if (typeof DeviceMotionEvent.requestPermission === "function" && !opts.auto) await DeviceMotionEvent.requestPermission(); window.addEventListener("devicemotion", onMotion); } catch (e) { }
   }
@@ -528,9 +571,20 @@ function detectStops(f) {
   }
 }
 function checkArrival(f) {
-  const dd = Math.hypot(f.xy[0] - R.dest[0], f.xy[1] - R.dest[1]);
-  if (dd < 70 && f.v < 1.5) { if (!R.arriveT) R.arriveT = f.t; if (f.t - R.arriveT > 10000) finishRide(true); }
+  // stopping at the destination, or at any other saved place (e.g. you went to the garage instead), ends the ride
+  let at = null;
+  if (Math.hypot(f.xy[0] - R.dest[0], f.xy[1] - R.dest[1]) < 70) at = R.destId;
+  else if (Date.now() - R.startT > 180000) for (const p of allPlaces()) { if (p.id === R.fromId) continue; const q = xyOf(p); if (Math.hypot(f.xy[0] - q[0], f.xy[1] - q[1]) < 70) { at = p.id; break; } }
+  if (at && f.v < 1.5) { if (!R.arriveT) R.arriveT = f.t; R.arrivedId = at; if (f.t - R.arriveT > 10000) finishRide(true); }
   else R.arriveT = null;
+}
+function setRideDest(id) {
+  const p = placeById(id); if (!p) return;
+  R.destId = id; R.dest = xyOf(p); R.destLL = p;
+  if (R.dir === "pm") { S.endpoint.pm = id; save("endpoint", S.endpoint); S.plan.pm = null; }
+  if (R.last) reroute(R.last, true); else R.route = null;
+  drawRideRoute(); renderRide();
+  speak("目的地改為" + p.name); toast("目的地：" + p.name);
 }
 const turnWord = d => ({ L: "左轉", R: "右轉", SL: "靠左", SR: "靠右", U: "迴轉" }[d] || "直行");
 const ARROWS = {
@@ -633,12 +687,17 @@ function renderRide() {
   const pills = [];
   const dl = parseClock(S.settings.deadline) || 32400;
   if (R.dir === "am" && tod() > dl - 4 * 3600 && tod() < dl + 3600) pills.push(arr > dl ? `<span class="pill late">晚 ${Math.ceil((arr - dl) / 60)} 分到</span>` : `<span class="pill ok">${S.settings.deadline} 前到</span>`);
-  const usual = S.trips.filter(x => x.dir === R.dir && x.duration > 300).map(x => x.duration);
+  const usual = S.trips.filter(x => x.dir === R.dir && x.duration > 300 && (R.dir === "am" ? (x.from || "home") === R.fromId : (x.to || "home") === R.destId)).map(x => x.duration);
   if (usual.length >= 3) {
     const delta = median(usual) - ((Date.now() - R.startT) / 1000 + rem);
     if (Math.abs(delta) >= 30) pills.push(`<span class="pill ${delta > 0 ? "ok" : "warn"}">比平常${delta > 0 ? "快" : "慢"} ${mmss(Math.abs(delta))}</span>`);
   }
-  $("rStatus").innerHTML = pills.join("");
+  $("rStatus").innerHTML = `<button class="dest-btn" id="rDest">往 ${esc(placeName(R.destId) || "目的地")} ▾</button>` + pills.join("");
+  $("rDest").onclick = () => {
+    const opts = R.dir === "am" ? allPlaces() : sidePlaces().concat(allPlaces().filter(p => p.id === "office"));
+    const i = opts.findIndex(p => p.id === R.destId);
+    setRideDest(opts[(i + 1) % opts.length].id);
+  };
   const sigLeft = r.signals.filter(x => x.d > d + 8);
   const waitLeft = sigLeft.reduce((a, s) => a + sigDelay(s, periodOf(tod())), 0);
   const info = [`<span>前方 <b class="num">${sigLeft.length}</b> 個號誌，預估等 <b class="num">${mmss(waitLeft)}</b></span>`];
@@ -668,11 +727,13 @@ async function finishRide(auto) {
   if (R.pts.length > 30) {
     const tr = { id: R.id, pts: R.pts };
     await DB.put(tr);
-    const trip = summarize(tr, R.dir, auto ? "nav" : "nav", R.pred);
+    const trip = summarize(tr, R.dir, "nav", R.pred);
+    if (R.arrivedId) trip.to = R.arrivedId;
+    if (R.fromId && !trip.from) trip.from = R.fromId;
     upsertTrip(trip);
     await learnFromTracks(tr); for (const k in S.sig) delete S.sig[k]._m;
     S.plan = { am: null, pm: null };
-    toast(`${auto ? "已抵達。" : ""}這趟 ${mins(trip.duration)} 分鐘、${(trip.dist / 1000).toFixed(1)} km，停 ${trip.nStops} 次，已存檔`);
+    toast(`${auto ? "已抵達" + (placeName(trip.to) ? "「" + placeName(trip.to) + "」" : "") + "。" : ""}這趟 ${mins(trip.duration)} 分鐘、${(trip.dist / 1000).toFixed(1)} km，停 ${trip.nStops} 次，已存檔`);
     speak(auto ? `已抵達，這趟 ${mins(trip.duration)} 分鐘` : "導航結束");
   } else { toast("導航結束（軌跡太短，沒有存檔）"); await DB.del(R.id); }
   show("plan"); renderAll(); startPassive();
@@ -682,7 +743,8 @@ function summarize(tr, dir, source, pred) {
   const t0 = new Date(tr.pts[0][0]), t1 = new Date(tr.pts[tr.pts.length - 1][0]);
   const dur = (t1 - t0) / 1000;
   const majors = []; for (const r of a.roads) if (r.dist > 300 && !/[巷弄]/.test(r.name) && r.name !== "無名道路" && majors[majors.length - 1] !== r.name) majors.push(r.name);
-  return { id: tr.id, date: dateStr(t0), dir, depart: Math.round(tod(t0)), arrive: Math.round(tod(t1)), duration: Math.round(dur), dist: Math.round(a.dist), moving: Math.round(a.moving), stopped: Math.round(a.stopped), nStops: a.stops.length, sigStops: a.stops.filter(s => s.sid).length, vAvg: a.moving ? +(a.dist / a.moving * 3.6).toFixed(1) : null, vMax: Math.round(a.vmax * 3.6), label: majors.slice(0, 5).join(" → "), pred: pred ? Math.round(pred) : null, source, hasTrack: true };
+  const p0 = tr.pts[0], p1 = tr.pts[tr.pts.length - 1];
+  return { id: tr.id, from: nearestPlace(p0[1], p0[2], 250), to: nearestPlace(p1[1], p1[2], 250), date: dateStr(t0), dir, depart: Math.round(tod(t0)), arrive: Math.round(tod(t1)), duration: Math.round(dur), dist: Math.round(a.dist), moving: Math.round(a.moving), stopped: Math.round(a.stopped), nStops: a.stops.length, sigStops: a.stops.filter(s => s.sid).length, vAvg: a.moving ? +(a.dist / a.moving * 3.6).toFixed(1) : null, vMax: Math.round(a.vmax * 3.6), label: majors.slice(0, 5).join(" → "), pred: pred ? Math.round(pred) : null, source, hasTrack: true };
 }
 /* make sure every stored track has a detailed summary: tracks from the first version,
    and rides whose page was closed before "結束" (saved every 20 s), get one here */
@@ -712,10 +774,8 @@ function startPassive() {
     const v = p.coords.speed;
     if (v != null && v > 4.5) PW.fast++; else PW.fast = 0;
     if (PW.fast >= 4 && !R.on) {
-      const xy = Graph.toXY(p.coords.latitude, p.coords.longitude);
-      const dh = Math.hypot(xy[0] - xyOf(S.settings.home)[0], xy[1] - xyOf(S.settings.home)[1]);
-      const dof = Math.hypot(xy[0] - xyOf(S.settings.office)[0], xy[1] - xyOf(S.settings.office)[1]);
-      startRide({ auto: true, dir: dh < dof ? "am" : "pm" });
+      const near = nearestPlace(p.coords.latitude, p.coords.longitude, 3000) || "home";
+      startRide({ auto: true, dir: near === "office" ? "pm" : "am", fromId: near });
     }
   }, () => { }, { enableHighAccuracy: true, maximumAge: 2000 });
 }
@@ -772,14 +832,18 @@ function renderSigEdit() {
 }
 
 /* ---------------- records view ---------------- */
+function tripEnds(t) {
+  const side = t.dir === "am" ? t.from : t.to;
+  return side && side !== "home" && placeName(side) ? (t.dir === "am" ? `（從${esc(placeName(side))}）` : `（到${esc(placeName(side))}）`) : "";
+}
 function renderRecords() {
   const H = S.settings.home, O = S.settings.office;
-  $("placeVal").textContent = `家：${H ? "已設定" : "未設定"}　公司：${O ? "已設定" : "未設定"}`;
+  $("placeVal").textContent = (H && O ? "" : `家：${H ? "已設定" : "未設定"}　公司：${O ? "已設定" : "未設定"}　`) + (allPlaces().length ? "已設定：" + allPlaces().map(p => p.name).join("、") : "");
   $("optVoice").checked = !!S.settings.voice; $("optMotion").checked = !!S.settings.motion; $("optDeadline").value = S.settings.deadline || "09:00";
   const tr = S.trips;
   const by = d => tr.filter(t => t.dir === d && t.duration > 300).map(t => t.duration);
   $("tripStats").innerHTML = `<p class="small">共 ${tr.length} 趟（上班 ${by("am").length} 趟，中位數 ${by("am").length ? mins(median(by("am"))) : "—"} 分；下班 ${by("pm").length} 趟，中位數 ${by("pm").length ? mins(median(by("pm"))) : "—"} 分）。</p>`;
-  $("tripList").innerHTML = tr.slice().reverse().slice(0, 60).map(t => `<button class="trip-row" data-id="${esc(t.id)}"><span style="min-width:0"><span class="nm">${t.date.slice(5).replace("-", "/")} ${DIRNAME[t.dir]} · ${clock(t.depart)} 出發</span><br>
+  $("tripList").innerHTML = tr.slice().reverse().slice(0, 60).map(t => `<button class="trip-row" data-id="${esc(t.id)}"><span style="min-width:0"><span class="nm">${t.date.slice(5).replace("-", "/")} ${DIRNAME[t.dir]}${tripEnds(t)} · ${clock(t.depart)} 出發</span><br>
     <span class="st">${t.partial ? "（未按結束，已自動保存）" : ""}${t.hasTrack ? `${(t.dist / 1000).toFixed(1)} km · 停 ${t.nStops} 次 · 行駛均速 ${t.vAvg || "—"} km/h${t.label ? " · " + esc(t.label) : ""}` : "只有時間軸紀錄（沒有詳細軌跡）"}</span></span>
     <span class="t num">${mins(t.duration)}<small class="small"> 分</small></span></button>`).join("");
   $("tripList").querySelectorAll(".trip-row").forEach(b => b.onclick = () => openTrip(b.dataset.id));
@@ -860,29 +924,68 @@ function tripActions(t, tr) {
   };
 }
 
-/* ---------------- home / office picker ---------------- */
-let pickMap, pickMk = {}, pickWhich = "home", pickTmp = {};
-async function openPicker() {
-  pickTmp = { home: S.settings.home, office: S.settings.office };
+/* ---------------- places picker (home, office, garage, …) ---------------- */
+let pickMap, pickMk = {}, pickWhich = "home", pickTmp = [];
+const pickGet = id => pickTmp.find(p => p.id === id);
+async function openPicker(focus) {
+  pickTmp = [{ id: "home", name: "家" }, { id: "office", name: "公司" }].map(b => Object.assign({}, b, placeById(b.id) || {}))
+    .concat((S.settings.places || []).map(p => Object.assign({}, p)));
   show("pick");
   if (!pickMap) {
     pickMap = mkMap("pickMap", { zoomCtl: true });
     pickMap.on("click", e => setPick(pickWhich, e.lngLat.lat, e.lngLat.lng));
   }
   await pickMap.ready; pickMap.resize();
-  for (const k of ["home", "office"]) { if (pickMk[k]) { pickMk[k].remove(); pickMk[k] = null; } if (pickTmp[k]) setPick(k, pickTmp[k].lat, pickTmp[k].lon, true); }
-  const pts = ["home", "office"].filter(k => pickTmp[k]).map(k => [pickTmp[k].lon, pickTmp[k].lat]);
-  if (pts.length === 2) fitTo(pickMap, pts, 60); else if (pts.length) pickMap.jumpTo({ center: pts[0], zoom: 16 }); else pickMap.jumpTo({ center: [121.525, 25.022], zoom: 13 });
-  setWhich(pickTmp.home ? (pickTmp.office ? "home" : "office") : "home");
+  for (const k in pickMk) { pickMk[k].remove(); delete pickMk[k]; }
+  for (const p of pickTmp) if (p.lat != null) setPick(p.id, p.lat, p.lon, true);
+  const pts = pickTmp.filter(p => p.lat != null).map(p => [p.lon, p.lat]);
+  if (pts.length >= 2) fitTo(pickMap, pts, 60); else if (pts.length) pickMap.jumpTo({ center: pts[0], zoom: 16 }); else pickMap.jumpTo({ center: [121.525, 25.022], zoom: 13 });
+  if (focus === "new") addPlace();
+  else setWhich(!pickGet("home").lat ? "home" : !pickGet("office").lat ? "office" : "home");
 }
-function setWhich(k) { pickWhich = k; $("pkHome").setAttribute("aria-pressed", k === "home"); $("pkOffice").setAttribute("aria-pressed", k === "office"); $("pkMsg").textContent = `點地圖放置「${k === "home" ? "家" : "公司"}」，或拖曳圖釘微調。`; }
-function setPick(k, lat, lon, quiet) {
+function renderPickSeg() {
+  $("pkSeg").innerHTML = pickTmp.map(p => `<button data-id="${esc(p.id)}" aria-pressed="${p.id === pickWhich}">${esc(p.name || "新地點")}${p.lat == null ? " ·未設" : ""}</button>`).join("") + '<button id="pkAdd">＋</button>';
+  $("pkSeg").querySelectorAll("button[data-id]").forEach(b => b.onclick = () => setWhich(b.dataset.id));
+  $("pkAdd").onclick = addPlace;
+}
+function addPlace() {
+  const n = pickTmp.filter(p => !["home", "office"].includes(p.id)).length;
+  const p = { id: "p" + Date.now().toString(36), name: n === 0 ? "車庫" : n === 1 ? "朋友車行" : "地點" + (n + 1), lat: null, lon: null };
+  pickTmp.push(p); setWhich(p.id);
+  setTimeout(() => { try { $("pkName").focus(); $("pkName").select(); } catch (e) { } }, 50);
+}
+function setWhich(id) {
+  pickWhich = id; renderPickSeg();
+  const p = pickGet(id), custom = !["home", "office"].includes(id);
+  $("pkNameRow").hidden = !custom;
+  if (custom) {
+    $("pkName").value = p.name;
+    $("pkName").oninput = e => { p.name = e.target.value.trim().slice(0, 12) || "地點"; renderPickSeg(); const el = pickMk[id] && pickMk[id].getElement().querySelector("span"); if (el) el.textContent = p.name.slice(0, 1); $("pkMsg").textContent = `點地圖放置「${p.name}」，或拖曳圖釘微調。`; };
+    $("pkDel").onclick = () => { pickTmp = pickTmp.filter(x => x.id !== id); if (pickMk[id]) { pickMk[id].remove(); delete pickMk[id]; } setWhich("home"); };
+  }
+  $("pkMsg").textContent = `點地圖放置「${p.name}」，或拖曳圖釘微調。`;
+}
+function placeEl(p) {
+  if (p.id === "home" || p.id === "office") return pinEl(p.id);
+  const el = pinEl("home"); el.querySelector(".pin").className = "pin other"; el.querySelector("span").textContent = (p.name || "地").slice(0, 1); return el;
+}
+function setPick(id, lat, lon, quiet) {
+  const p = pickGet(id); if (!p) return;
   const xy = Graph.toXY(lat, lon);
-  if (!Graph.nearEdges(xy[0], xy[1], 200, null).length) { toast("這個位置離可騎的道路太遠，或超出路網範圍（永和到中山區）"); if (pickMk[k] && pickTmp[k]) pickMk[k].setLngLat([pickTmp[k].lon, pickTmp[k].lat]); return; }
-  pickTmp[k] = { lat, lon };
-  if (pickMk[k]) pickMk[k].setLngLat([lon, lat]);
-  else { pickMk[k] = new maplibregl.Marker({ element: pinEl(k), anchor: "bottom", draggable: true }).setLngLat([lon, lat]).addTo(pickMap); pickMk[k].on("dragend", () => { const p = pickMk[k].getLngLat(); setPick(k, p.lat, p.lng, true); }); }
-  if (!quiet && k === "home" && !pickTmp.office) setWhich("office");
+  if (!Graph.nearEdges(xy[0], xy[1], 200, null).length) { toast("這個位置離可騎的道路太遠，或超出路網範圍（永和到中山區）"); if (pickMk[id] && p.lat != null) pickMk[id].setLngLat([p.lon, p.lat]); return; }
+  p.lat = lat; p.lon = lon;
+  if (pickMk[id]) pickMk[id].setLngLat([lon, lat]);
+  else { pickMk[id] = new maplibregl.Marker({ element: placeEl(p), anchor: "bottom", draggable: true }).setLngLat([lon, lat]).addTo(pickMap); pickMk[id].on("dragend", () => { const q = pickMk[id].getLngLat(); setPick(id, q.lat, q.lng, true); }); }
+  if (!quiet) { renderPickSeg(); if (id === "home" && pickGet("office").lat == null) setWhich("office"); }
+}
+function savePlaces() {
+  const H = pickGet("home"), O = pickGet("office");
+  if (H.lat == null || O.lat == null) { toast("家和公司都要設定"); return; }
+  S.settings.home = { lat: H.lat, lon: H.lon }; S.settings.office = { lat: O.lat, lon: O.lon };
+  S.settings.places = pickTmp.filter(p => !["home", "office"].includes(p.id) && p.lat != null).map(p => ({ id: p.id, name: p.name, lat: p.lat, lon: p.lon }));
+  for (const d of ["am", "pm"]) if (S.endpoint[d] && !placeById(S.endpoint[d])) S.endpoint[d] = null;
+  save("endpoint", S.endpoint); saveSettings();
+  S.plan = { am: null, pm: null }; show("plan"); renderAll(); startPassive(); toast("已儲存地點");
 }
 function pickHere() {
   if (!("geolocation" in navigator)) return;
@@ -904,8 +1007,8 @@ async function exportGpx() { const t = (await DB.all()).filter(x => x.pts && x.p
 async function exportJson() { download(`commute-backup-${dateStr()}.json`, JSON.stringify({ app: "super-speed-commuters", v: 2, settings: S.settings, trips: S.trips, signals: S.sig, tracks: await DB.all() }), "application/json"); }
 const parseLL = s => { const m = String(s).match(/(-?\d+(?:\.\d+)?)°?\s*,\s*(-?\d+(?:\.\d+)?)/); return m ? [+m[1], +m[2]] : null; };
 function dirFor(pts) {
-  const H = S.settings.home, O = S.settings.office, a = Graph.toXY(pts[0][1], pts[0][2]);
-  if (H && O) { const h = xyOf(H), o = xyOf(O); return Math.hypot(a[0] - h[0], a[1] - h[1]) < Math.hypot(a[0] - o[0], a[1] - o[1]) ? "am" : "pm"; }
+  const near = nearestPlace(pts[0][1], pts[0][2], 3000);
+  if (near) return near === "office" ? "pm" : "am";
   return periodOf(tod(new Date(pts[0][0])));
 }
 async function importFiles(files) {
@@ -940,23 +1043,22 @@ async function importFiles(files) {
       const segs = Array.isArray(j) ? j : (j.semanticSegments || []);
       const H = S.settings.home, O = S.settings.office;
       if (!H || !O) { msgs.push("請先設定家與公司，才能從時間軸找出通勤"); continue; }
-      const hx = xyOf(H), ox = xyOf(O), visits = [];
+      const visits = [];
       for (const s of segs) {
         const v = s.visit && s.visit.topCandidate; if (!v) continue;
         const ll = parseLL(v.placeLocation && (v.placeLocation.latLng || v.placeLocation)); if (!ll) continue;
-        const xy = Graph.toXY(ll[0], ll[1]);
-        visits.push({ place: Math.hypot(xy[0] - hx[0], xy[1] - hx[1]) < 200 ? "H" : Math.hypot(xy[0] - ox[0], xy[1] - ox[1]) < 200 ? "O" : null, t0: Date.parse(s.startTime), t1: Date.parse(s.endTime) });
+        visits.push({ place: nearestPlace(ll[0], ll[1], 200), t0: Date.parse(s.startTime), t1: Date.parse(s.endTime) });
       }
       visits.sort((a, b) => a.t0 - b.t0);
       let n = 0;
       for (let i = 0; i < visits.length - 1; i++) {
         const a = visits[i], b = visits[i + 1];
-        if (!a.place || !b.place || a.place === b.place) continue;
+        if (!a.place || !b.place || a.place === b.place || (a.place !== "office" && b.place !== "office")) continue;
         const dur = (b.t0 - a.t1) / 1000; if (dur < 300 || dur > 7200) continue;
-        const t0 = new Date(a.t1), dir = a.place === "H" ? "am" : "pm"; if (t0.getDay() === 0 || t0.getDay() === 6) continue;
+        const t0 = new Date(a.t1), dir = b.place === "office" ? "am" : "pm"; if (t0.getDay() === 0 || t0.getDay() === 6) continue;
         const id = dateStr(t0) + "_" + dir + "_" + pad(t0.getHours()) + pad(t0.getMinutes());
         if (S.trips.some(x => x.id === id)) continue;
-        S.trips.push({ id, date: dateStr(t0), dir, depart: Math.round(tod(t0)), arrive: Math.round(tod(new Date(b.t0))), duration: Math.round(dur), source: "timeline", hasTrack: false }); n++;
+        S.trips.push({ id, from: a.place, to: b.place, date: dateStr(t0), dir, depart: Math.round(tod(t0)), arrive: Math.round(tod(new Date(b.t0))), duration: Math.round(dur), source: "timeline", hasTrack: false }); n++;
       }
       S.trips.sort((a, b) => a.id < b.id ? -1 : 1); saveTrips();
       msgs.push(`${f.name}：從時間軸新增 ${n} 趟通勤`);
@@ -991,8 +1093,7 @@ async function boot() {
   $("rOverview").onclick = () => { if (R.follow) overview(); else setFollow(true); };
   document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => { show(b.dataset.v); if (b.dataset.v === "sig") renderSignals(); if (b.dataset.v === "set") renderRecords(); });
   $("obSet").onclick = openPicker; $("openPicker").onclick = openPicker;
-  $("pkHome").onclick = () => setWhich("home"); $("pkOffice").onclick = () => setWhich("office"); $("pkHere").onclick = pickHere;
-  $("pkSave").onclick = () => { if (!pickTmp.home || !pickTmp.office) { toast("家和公司都要設定"); return; } S.settings.home = pickTmp.home; S.settings.office = pickTmp.office; saveSettings(); S.plan = { am: null, pm: null }; show("plan"); renderAll(); startPassive(); toast("已儲存家和公司"); };
+  $("pkHere").onclick = pickHere; $("pkSave").onclick = savePlaces;
   $("pkCancel").onclick = () => { show(S.settings.home ? "set" : "plan"); };
   $("tBack").onclick = () => { show("set"); renderRecords(); };
   $("optAuto").onchange = e => { S.settings.auto = e.target.checked; saveSettings(); if (S.settings.auto) startPassive(); else stopPassive(); };

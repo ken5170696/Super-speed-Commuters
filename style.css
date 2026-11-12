@@ -158,3 +158,17 @@ body.riding #app{padding:0}
 .onboard h2{font-size:19px}
 @media (max-width:380px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.man-dist{font-size:34px}.man-road{font-size:18px}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* place chips (where you leave from / ride to) */
+.chips{display:flex;gap:6px;overflow-x:auto;align-items:center;padding-bottom:2px;scrollbar-width:none}
+.chips:empty{display:none}
+.chips-k{font-size:13px;color:var(--muted);font-weight:700;flex:none}
+.chip{flex:none;border:1.5px solid var(--line);background:var(--surface);border-radius:999px;padding:6px 14px;font-weight:800;font-size:14.5px;color:var(--ink-2)}
+.chip[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.chip small{font-size:10.5px;font-weight:700;margin-left:5px;opacity:.75}
+.chip.add{border-style:dashed}
+.seg.scroll{overflow-x:auto;scrollbar-width:none}
+.seg.scroll button{flex:1 0 auto;white-space:nowrap}
+#pkName{background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:7px 9px;width:150px}
+.pin.other{background:#8a4fd3}
+.dest-btn{border:1.5px solid var(--line);background:var(--surface-2);color:var(--ink);border-radius:999px;padding:4px 12px;font-weight:800;font-size:13.5px}

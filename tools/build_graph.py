@@ -135,15 +135,11 @@ def conditions(t):
     return rules
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--tiles", required=True)
-    ap.add_argument("--out", default="data/graph.json")
-    a = ap.parse_args()
-    if not glob.glob(a.tiles + "/*.osm"):
-        download(a.tiles)
+def load_tiles(d):
+    if not glob.glob(d + "/*.osm"):
+        download(d)
     nodes, ways, rels = {}, {}, {}
-    for fn in sorted(glob.glob(a.tiles + "/*.osm")):
+    for fn in sorted(glob.glob(d + "/*.osm")):
         for _, el in ET.iterparse(fn):
             if el.tag == "node":
                 i = int(el.get("id"))
@@ -165,6 +161,66 @@ def main():
                 if t.get("type") == "restriction" and i not in rels:
                     rels[i] = ([(m.get("type"), int(m.get("ref")), m.get("role")) for m in el.findall("member")], t)
                 el.clear()
+    return nodes, ways, rels
+
+
+def load_pbf(path, bbox):
+    """Read an OSM .pbf extract (e.g. Geofabrik's Taiwan file) with pyosmium, keeping ways that touch bbox."""
+    import osmium
+    W, S, E, N = bbox
+    inside = lambda lat, lon: W <= lon <= E and S <= lat <= N
+    nodes, ways, rels, sig = {}, {}, {}, set()
+
+    class H(osmium.SimpleHandler):
+        def node(self, n):
+            t = n.tags
+            if t.get("highway") == "traffic_signals" or t.get("crossing") == "traffic_signals":
+                sig.add(n.id)
+
+        def way(self, w):
+            t = {k: v for k, v in w.tags}
+            if not allowed(t):
+                return
+            try:
+                pts = [(n.ref, n.location.lat, n.location.lon) for n in w.nodes]
+            except osmium.InvalidLocationError:
+                return
+            if not any(inside(la, lo) for _, la, lo in pts):
+                return
+            ways[w.id] = ([r for r, _, _ in pts], t)
+            for r, la, lo in pts:
+                nodes[r] = (la, lo, False)
+
+        def relation(self, r):
+            t = {k: v for k, v in r.tags}
+            if t.get("type") == "restriction":
+                rels[r.id] = ([(m.type == "w" and "way" or m.type == "n" and "node" or "relation", m.ref, m.role) for m in r.members], t)
+
+    H().apply_file(path, locations=True, idx="flex_mem")
+    for i in sig:
+        if i in nodes:
+            la, lo, _ = nodes[i]
+            nodes[i] = (la, lo, True)
+    return nodes, ways, rels
+
+
+def main():
+    global BBOX
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tiles", help="directory of OSM API map extracts (*.osm)")
+    ap.add_argument("--pbf", help="OSM .pbf extract, e.g. taiwan-latest.osm.pbf")
+    ap.add_argument("--bbox", help="W,S,E,N in degrees (default: the original commute corridor)")
+    ap.add_argument("--out", default="data/graph.json")
+    a = ap.parse_args()
+    if a.bbox:
+        BBOX = tuple(float(x) for x in a.bbox.split(","))
+    if a.pbf:
+        nodes, ways, rels = load_pbf(a.pbf, BBOX)
+    elif a.tiles:
+        nodes, ways, rels = load_tiles(a.tiles)
+    else:
+        ap.error("give --pbf or --tiles")
+    print(f"read {len(nodes)} nodes, {len(ways)} ways, {len(rels)} restrictions")
 
     # which nodes must survive contraction
     use = defaultdict(int)
@@ -245,7 +301,7 @@ def main():
                     rs.append([v, f, t2, typ])
 
     sig = [i for i, n in enumerate(osm_ids) if nodes[n][2]]
-    out = {"v": 1, "built": time.strftime("%Y-%m-%d"), "source": "© OpenStreetMap contributors (ODbL)",
+    out = {"v": 1, "built": time.strftime("%Y-%m-%d"), "source": "© OpenStreetMap contributors (ODbL)", "bbox": list(BBOX),
            "proj": {"lat0": LAT0, "lon0": LON0, "kx": KX, "ky": KY},
            "names": names, "xy": xy, "sig": sig, "sigOsm": [osm_ids[i] for i in sig],
            "edges": [x for e in edges for x in e], "geom": geom, "restr": [x for r in rs for x in r], "cond": cond}

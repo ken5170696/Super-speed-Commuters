@@ -1,0 +1,54 @@
+name: Build road network
+
+# Rebuilds the routing graph for all of Taipei City plus the core New Taipei districts
+# from Geofabrik's Taiwan OpenStreetMap extract, then the live-traffic section map and
+# the official signal timing plans that depend on it. Monthly, or run it by hand.
+on:
+  schedule:
+    - cron: "47 19 1 * *"   # 2nd of each month, 03:47 Taipei time
+  workflow_dispatch:
+    inputs:
+      bbox:
+        description: "W,S,E,N"
+        default: "121.40,24.93,121.67,25.21"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-network
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pyosmium
+        run: pip install osmium
+
+      - name: Download Taiwan OSM extract
+        run: curl -sSfL --retry 4 -o taiwan.osm.pbf https://download.geofabrik.de/asia/taiwan-latest.osm.pbf
+
+      - name: Build routing graph
+        run: python3 tools/build_graph.py --pbf taiwan.osm.pbf --bbox "${{ github.event.inputs.bbox || '121.40,24.93,121.67,25.21' }}"
+
+      - name: Map live traffic sections
+        run: |
+          curl -sSfL --retry 4 -o getvd.xml.gz https://tcgbusfs.blob.core.windows.net/blobtisv/GetVD.xml.gz
+          node tools/build_vd_map.js getvd.xml.gz
+
+      - name: Locate official signal timing plans
+        run: python3 tools/build_signal_plans.py
+
+      - name: Commit
+        run: |
+          ls -la data/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/graph.json data/vd_map.json data/signal_plans.json
+          git diff --cached --quiet && { echo "no changes"; exit 0; }
+          git commit -m "Rebuild road network for all of Taipei ($(date -u +%Y-%m-%d))"
+          git push

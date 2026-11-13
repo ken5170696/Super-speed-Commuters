@@ -178,3 +178,6 @@ body.riding{position:fixed;inset:0;overflow:hidden;overscroll-behavior:none}
 .sigcard.compact .sc-big{display:none}
 .sigcard.compact .sc-sub{font-size:12px}
 .stamp-float{position:absolute;left:50%;transform:translateX(-50%);bottom:calc(214px + env(safe-area-inset-bottom,0));z-index:6;border:0;border-radius:999px;background:var(--go);color:var(--go-ink);font-weight:900;font-size:16px;padding:12px 20px;box-shadow:0 4px 14px rgba(0,0,0,.3)}
+
+.sc-flip{flex:none;align-self:center;border:1px solid #d6dbd5;background:#f4f6f3;color:#47525a;border-radius:10px;padding:6px 8px;font-size:12px;font-weight:800;pointer-events:auto}
+.ride-top .sigcard{pointer-events:auto}

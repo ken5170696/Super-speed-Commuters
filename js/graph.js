@@ -209,8 +209,12 @@ function route(from, to, opts = {}) {
   const goals = nearEdges(to.x, to.y, 150, null).filter(g => edgeOpen(g.de, T)).slice(0, 4);
   if (!goals.length) return null;
   const S = via ? 2 : 1, viaId = via ? G.names.indexOf(via) : -1;
-  const NS = 2 * G.M * S;
-  const dist = new Float64Array(NS).fill(Infinity), prev = new Int32Array(NS).fill(-2);
+  // search buffers are allocated once and reused; a generation stamp marks which entries are valid
+  if (!G.rb) G.rb = { d: new Float64Array(4 * G.M), p: new Int32Array(4 * G.M), g: new Uint32Array(4 * G.M), cur: 0 };
+  const RB = G.rb; RB.cur++;
+  const gen = RB.g, cur = RB.cur, dd = RB.d, pp = RB.p;
+  const dist = { get: i => gen[i] === cur ? dd[i] : Infinity, set: (i, v) => { if (gen[i] !== cur) { gen[i] = cur; pp[i] = -2; } dd[i] = v; } };
+  const prev = { get: i => gen[i] === cur ? pp[i] : -2, set: (i, v) => { pp[i] = v; } };
   const h = new Heap();
   const vmax = 15;
   const hEst = n => Math.hypot(G.xy[2 * n] - to.x, G.xy[2 * n + 1] - to.y) / vmax;
@@ -218,7 +222,7 @@ function route(from, to, opts = {}) {
   for (const s of starts) {
     const st = via && G.ename[deE(s.de)] === viaId ? 1 : 0;
     const id = s.de * S + st, c = (1 - s.f) * edgeCost(s.de, habitW) + s.d * .5;
-    if (c < dist[id]) { dist[id] = c; prev[id] = -1; startF.set(s.de, s.f); h.push(c + hEst(deTo(s.de)), id); }
+    if (c < dist.get(id)) { dist.set(id, c); prev.set(id, -1); startF.set(s.de, s.f); h.push(c + hEst(deTo(s.de)), id); }
   }
   // goal directed edges: arrive at their start node, then go partially along
   const goalBy = new Map();
@@ -232,8 +236,8 @@ function route(from, to, opts = {}) {
   while (h.size) {
     const id = h.pop(); const key = h.lastKey;
     if (key >= best) break;
-    if (++pops > 400000) break;
-    const de = Math.floor(id / S), st = id % S, c = dist[id];
+    if (++pops > 2500000) break;
+    const de = Math.floor(id / S), st = id % S, c = dist.get(id);
     const n = deTo(de);
     if (st === S - 1 || !via) {
       const gs = goalBy.get(n);
@@ -251,7 +255,7 @@ function route(from, to, opts = {}) {
       const st2 = st === 0 && via && G.ename[deE(de2)] === viaId ? 1 : st;
       const c2 = c + edgeCost(de2, habitW) + turnCost(de, de2) + (G.isSig[deTo(de2)] ? SIG_COST : 0);
       const id2 = de2 * S + st2;
-      if (c2 < dist[id2]) { dist[id2] = c2; prev[id2] = id; h.push(c2 + hEst(deTo(de2)), id2); }
+      if (c2 < dist.get(id2)) { dist.set(id2, c2); prev.set(id2, id); h.push(c2 + hEst(deTo(de2)), id2); }
     }
   }
   if (bestId === -1) return null;
@@ -259,7 +263,7 @@ function route(from, to, opts = {}) {
   if (bestId === -10) { path = [bestGoal.s.de]; f0 = bestGoal.s.f; f1 = bestGoal.g.f; }
   else {
     path = []; let id = bestId;
-    while (id >= 0) { path.push(Math.floor(id / S)); id = prev[id]; }
+    while (id >= 0) { path.push(Math.floor(id / S)); id = prev.get(id); }
     path.reverse();
     f0 = startF.get(path[0]) || 0;
     path.push(bestGoal.g.de); f1 = bestGoal.g.f;
@@ -345,6 +349,20 @@ function sigNameById(id) {
   return sigName(nodes.length ? nodes : [n], null).name;
 }
 function sigNodeXY(id) { const n = G.osmNode.get(+String(id).slice(1)); return n == null ? null : nxy(n); }
+/* every signal node within r metres, nearest first */
+function signalsNear(x, y, r) {
+  const out = new Map();
+  const c0x = Math.floor((x - r) / G.cell), c1x = Math.floor((x + r) / G.cell), c0y = Math.floor((y - r) / G.cell), c1y = Math.floor((y + r) / G.cell);
+  for (let cx = c0x; cx <= c1x; cx++) for (let cy = c0y; cy <= c1y; cy++) {
+    const a = G.grid.get(cx * 100003 + cy); if (!a) continue;
+    for (let i = 0; i < a.length; i += 2) for (const n of [G.eu[a[i]], G.ev[a[i]]]) {
+      if (!G.isSig[n] || out.has(n)) continue;
+      const d = Math.hypot(G.xy[2 * n] - x, G.xy[2 * n + 1] - y);
+      if (d <= r) out.set(n, { n, d, id: G.sigCluster.get(n) });
+    }
+  }
+  return [...out.values()].sort((a, b) => a.d - b.d);
+}
 /* nearest signal cluster to a point, within maxD metres */
 function nearestSignal(x, y, maxD) {
   let best = null;
@@ -403,5 +421,5 @@ function matchTrack(pts) {
   return out;
 }
 
-global.Graph = { G, load, route, project, matchTrack, toXY, toLL, nameOf, shortName, deE, deTo, deFrom, timeAlong, priorDelay, vOf, nearEdges, SPEED_KMH, sigNameById, sigNodeXY, nearestSignal, setLive, edgeOpen, timeCtx, bearingIn: de => deBearIn(de), edgeKey: e => [G.eu[e], G.ev[e]].map(n => G.xy[2 * n] + "," + G.xy[2 * n + 1]).join("|"), edgePtsLL: de => dePts(de).map(p => toLL(p[0], p[1])) };
+global.Graph = { G, load, route, project, matchTrack, toXY, toLL, nameOf, shortName, deE, deTo, deFrom, timeAlong, priorDelay, vOf, nearEdges, SPEED_KMH, sigNameById, sigNodeXY, nearestSignal, signalsNear, setLive, edgeOpen, timeCtx, bearingIn: de => deBearIn(de), edgeKey: e => [G.eu[e], G.ev[e]].map(n => G.xy[2 * n] + "," + G.xy[2 * n + 1]).join("|"), edgePtsLL: de => dePts(de).map(p => toLL(p[0], p[1])) };
 })(window);

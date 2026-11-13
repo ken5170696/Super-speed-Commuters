@@ -37,6 +37,7 @@ const S = {
   blocks: load("blocks", []),   // roads you told the app you cannot ride: [{key, name}]
   skips: load("skips", {}),     // "edgeKey|dir" -> times you ignored an instruction to take it
   phase: load("phase", {}),     // "sid|heading" -> [[phase index, seconds off the official plan], ...]
+  phaseFix: load("phaseFix", {}), // "sid|heading" -> green block you said is yours
 };
 /* apply your road blocks and refusals to the routing graph */
 function applyRoadPrefs() {
@@ -177,12 +178,8 @@ async function loadPlans() {
     OFF.ic = j.ic; OFF.info = j.infoTime;
     // link every signal point within 40 m of an official intersection (wide junctions have several)
     const best = new Map();
-    for (const [n, sid] of G.sigCluster) {
-      const x = G.xy[2 * n], y = G.xy[2 * n + 1];
-      for (const [id, o] of Object.entries(j.ic)) {
-        const d = Math.hypot(o.x - x, o.y - y);
-        if (d <= 40 && (!best.has(sid) || d < best.get(sid)[1])) best.set(sid, [id, d]);
-      }
+    for (const [id, o] of Object.entries(j.ic)) for (const s of Graph.signalsNear(o.x, o.y, 40)) {
+      if (!best.has(s.id) || s.d < best.get(s.id)[1]) best.set(s.id, [id, s.d]);
     }
     for (const [sid, [id]] of best) OFF.bySid.set(sid, id);
   } catch (e) { }
@@ -193,49 +190,79 @@ function planAt(ic, date) {
   const min = date.getHours() * 60 + date.getMinutes();
   let pid = sched[sched.length - 1][1]; for (const [mm, p] of sched) if (mm <= min) pid = p;
   const p = o.p[pid]; if (!p) return null;
-  const [C, off, axis, ph] = p, starts = []; let acc = 0;
-  for (const [g, y, ar] of ph) { starts.push(acc); acc += g + y + ar; }
-  return { C, off, axis, ph, starts, pid, ic };
+  const [C, off, axis, ph] = p;
+  // A phase with no yellow and no all-red flows straight into the next one (early start for
+  // pedestrians or turns), so for riders the two form one green block that starts at the first.
+  const blocks = []; let acc = 0, cur = null;
+  ph.forEach(([g, y, ar], i) => {
+    if (!cur) cur = { start: acc, go: 0, phases: [] };
+    cur.go += g + y; cur.phases.push(i);
+    acc += g + y + ar;
+    if (y + ar > 0 || i === ph.length - 1) { blocks.push(cur); cur = null; }
+  });
+  // a trailing block without clearance wraps into the first one
+  if (blocks.length > 1 && ph[ph.length - 1][1] + ph[ph.length - 1][2] === 0) { const last = blocks.pop(); blocks[0].start = last.start; blocks[0].go += last.go; blocks[0].phases = last.phases.concat(blocks[0].phases); }
+  return { C, off, axis, ph, blocks, pid, ic };
 }
 const hdBucket = deg => Math.round(mod(deg, 360) / 90) % 4;   // 0 N, 1 E, 2 S, 3 W (direction of travel)
+const majorBlocks = P => P.blocks.map((b, i) => ({ i, go: b.go })).filter(x => x.go >= 15);
 function phaseGuess(P, deg) {
-  // which phase serves you: learned from your stops, else a guess from the plan's main axis
-  const major = P.ph.map((p, i) => ({ i, g: p[0] })).filter(x => x.g >= 12).sort((a, b) => b.g - a.g);
+  // plans list phases in order and "direction" gives the axis the first one serves;
+  // the first major green block serves that axis, the next major block the crossing road
+  const major = majorBlocks(P);
   if (!major.length) return 0;
   const along = (hdBucket(deg) % 2 === 0) === (P.axis % 4 === 0);
   return along || major.length === 1 ? major[0].i : major[1].i;
 }
 function phaseLearned(sid, deg) {
-  const rec = S.phase[sid + "|" + hdBucket(deg)]; if (!rec || rec.length < 2) return null;
+  const k = sid + "|" + hdBucket(deg);
+  if (S.phaseFix[k] != null) return { i: S.phaseFix[k], shift: globalShiftCached, n: 0, fixed: true };
+  const rec = S.phase[k]; if (!rec || !rec.length) return null;
   const cnt = {}; for (const [i] of rec) cnt[i] = (cnt[i] || 0) + 1;
   const i = +Object.entries(cnt).sort((a, b) => b[1] - a[1])[0][0];
   const sh = rec.filter(r => r[0] === i).map(r => r[1]);
-  if (sh.length < 2) return null;
   const mshift = median(sh), spread = median(sh.map(x => Math.abs(x - mshift)));
+  if (sh.length === 1) return Math.abs(mshift) <= 10 ? { i, shift: mshift, n: 1 } : null;   // one stop already picks the direction
   return spread <= 6 ? { i, shift: mshift, n: sh.length } : null;
 }
+let globalShiftCached = 0;
 function globalShift() {
-  const all = []; for (const k in S.phase) { const [sid, b] = k.split("|"); const l = phaseLearned(sid, b * 90); if (l) all.push(l.shift); }
-  return all.length >= 3 ? median(all) : 0;
+  const all = []; for (const k in S.phase) { const [sid, b] = k.split("|"); const l = phaseLearned(sid, b * 90); if (l && !l.fixed && l.n >= 2) all.push(l.shift); }
+  globalShiftCached = all.length >= 3 ? median(all) : 0;
+  return globalShiftCached;
 }
 function learnPhase(sid, onsetSec, date, deg) {
-  // compare a "light turned green" moment with the official plan: which phase was it, and how far off is our clock reference
+  // compare a "light turned green" moment with the official plan: which green block was it, and how far off is our clock
   const ic = OFF.bySid.get(sid); if (!ic || deg == null) return;
   const P = planAt(ic, date); if (!P) return;
   let best = null;
-  P.ph.forEach((p, i) => { if (p[0] < 8) return; let d = mod(onsetSec - (P.off + P.starts[i]), P.C); if (d > P.C / 2) d -= P.C; if (!best || Math.abs(d) < Math.abs(best[1])) best = [i, Math.round(d)]; });
+  majorBlocks(P).forEach(({ i }) => { let d = mod(onsetSec - (P.off + P.blocks[i].start), P.C); if (d > P.C / 2) d -= P.C; if (!best || Math.abs(d) < Math.abs(best[1])) best = [i, Math.round(d)]; });
   if (!best) return;
   const k = sid + "|" + hdBucket(deg);
   (S.phase[k] = S.phase[k] || []).push(best); if (S.phase[k].length > 12) S.phase[k].shift();
-  save("phase", S.phase);
+  save("phase", S.phase); globalShift();
+}
+function flipPhase(sid, deg) {
+  // "this is the other direction's light": move to the next major green block for this approach
+  const ic = OFF.bySid.get(sid); if (!ic || deg == null) return null;
+  const P = planAt(ic, new Date()); if (!P) return null;
+  const major = majorBlocks(P).map(x => x.i); if (major.length < 2) return null;
+  const k = sid + "|" + hdBucket(deg);
+  const cur = officialModel(sid, new Date(), deg);
+  const at = Math.max(0, major.indexOf(cur ? cur.block : major[0]));
+  S.phaseFix[k] = major[(at + 1) % major.length]; delete S.phase[k];
+  save("phaseFix", S.phaseFix); save("phase", S.phase);
+  return S.phaseFix[k];
 }
 function officialModel(sid, date, deg) {
   const ic = OFF.bySid.get(sid); if (!ic) return null;
   const P = planAt(ic, date); if (!P) return null;
   const L = deg != null ? phaseLearned(sid, deg) : null;
-  const i = L ? L.i : phaseGuess(P, deg == null ? 0 : deg);
-  const shift = L ? L.shift : globalShift();
-  return { cycle: P.C, green: Math.max(3, P.ph[i][0] + P.ph[i][1] - 1), ref: mod(P.off + P.starts[i] + shift, P.C), src: L ? "official" : "official?", n: L ? L.n : 0, plan: P };
+  let i = L ? L.i : phaseGuess(P, deg == null ? 0 : deg);
+  if (!P.blocks[i]) i = 0;
+  const shift = L ? L.shift : globalShiftCached;
+  const b = P.blocks[i];
+  return { cycle: P.C, green: Math.max(3, b.go - 1), ref: mod(P.off + b.start + shift, P.C), src: L && (L.n >= 2 || L.fixed) ? "official" : "official?", n: L ? L.n : 0, block: i, plan: P };
 }
 /* best available model for a signal at a given moment: manual > official plan > learned from your stops */
 function modelFor(sid, date, deg) {
@@ -475,7 +502,7 @@ function renderPlan() {
   const plan = S.plan[S.dir] || (S.plan[S.dir] = computePlan(S.dir));
   if (S.sel[S.dir] >= plan.length) S.sel[S.dir] = 0;
   const cur = plan[S.sel[S.dir]];
-  if (!cur) { $("planHero").innerHTML = "<p>找不到路線，請確認家和公司的位置在永和到中山區之間的道路旁。</p>"; return; }
+  if (!cur) { $("planHero").innerHTML = "<p>找不到路線，請確認家和公司在路網範圍內的道路旁。</p>"; return; }
   const now = tod(), arrive = now + cur.sec;
   const like = tripsLike(S.dir), ts = like.list.map(t => t.duration);
   let extra = "";
@@ -719,7 +746,7 @@ function predict(s, distM, v) {
   if (!m) return { state: "unk", st, m: null };
   const mNow = modelFor(s.id, new Date(), deg) || m;
   const Lt = lightAt(m, tArr), now = lightAt(mNow, tod());
-  const conf = m.src === "manual" ? "手動設定" : m.src === "official" ? `官方時制 · 已用你的停等驗證 ${m.n} 次` : m.src === "official?" ? "官方時制（行向待驗證）" : `已學習 ${m.n} 次`;
+  const conf = m.src === "manual" ? "手動設定" : m.src === "official" ? (m.n ? `官方時制 · 已用你的停等驗證 ${m.n} 次` : "官方時制 · 你已校正方向") : m.src === "official?" ? "官方時制（行向待驗證）" : `已學習 ${m.n} 次`;
   if (Lt.green && Lt.left >= 3) return { state: "go", left: Lt.left, now, m, conf };
   if (Lt.green) return { state: "amber", now, m, conf };
   const tg = tArr + Lt.wait - tod(), vNeed = distM / tg * 3.6;
@@ -792,7 +819,8 @@ function renderRide() {
       ringHtml = `<div class="ring-box">${ring(frac, p.now.green ? "#22b35e" : "#e5483d")}<span class="num">${Math.round(p.now.green ? p.now.left : p.now.wait)}</span></div>`;
     }
     card.className = "sigcard " + p.state + (p.state === "unk" ? " compact" : "");
-    card.innerHTML = `${ringHtml}<div class="sc-body"><div class="sc-top"><span class="num sc-dist">${fmtDistTxt(dist)}</span><span class="sc-name">${esc(s.name)}</span></div><div class="sc-big">${esc(big)}</div><div class="sc-sub">${esc(sub)}</div></div>`;
+    const flip = p.m && String(p.m.src).startsWith("official") ? `<button class="sc-flip" data-sid="${esc(s.id)}" data-deg="${s.de != null ? Math.round(Graph.bearingIn(s.de) * 180 / Math.PI) : ""}">方向不對</button>` : "";
+    card.innerHTML = `${ringHtml}<div class="sc-body"><div class="sc-top"><span class="num sc-dist">${fmtDistTxt(dist)}</span><span class="sc-name">${esc(s.name)}</span></div><div class="sc-big">${esc(big)}</div><div class="sc-sub">${esc(sub)}</div></div>${flip}`;
     if (p.state !== "unk" && dist < 260 && dist > 110) speak(p.state === "go" ? "前方綠燈，保持" : p.state === "slow" ? `前方紅燈，收油到 ${p.v}` : "前方紅燈", "s" + s.id + p.state);
   } else { card.className = "sigcard empty"; card.innerHTML = ""; }
   $("rRail").innerHTML = preds.slice(first && first.dist < 800 ? 1 : 0).filter(x => x.p.state !== "unk").slice(0, 3).map(({ s, dist, p }) => `<div class="rail-i"><i style="background:${STATE_COLOR[p.state]}"></i><span class="num">${fmtDistTxt(dist)}</span><b>${esc(sigLabel(p) || "—")}</b></div>`).join("");
@@ -1099,7 +1127,7 @@ function placeEl(p) {
 function setPick(id, lat, lon, quiet) {
   const p = pickGet(id); if (!p) return;
   const xy = Graph.toXY(lat, lon);
-  if (!Graph.nearEdges(xy[0], xy[1], 200, null).length) { toast("這個位置離可騎的道路太遠，或超出路網範圍（永和到中山區）"); if (pickMk[id] && p.lat != null) pickMk[id].setLngLat([p.lon, p.lat]); return; }
+  if (!Graph.nearEdges(xy[0], xy[1], 200, null).length) { toast("這個位置離可騎的道路太遠，或超出路網範圍（台北市與新北市核心區）"); if (pickMk[id] && p.lat != null) pickMk[id].setLngLat([p.lon, p.lat]); return; }
   p.lat = lat; p.lon = lon;
   if (pickMk[id]) pickMk[id].setLngLat([lon, lat]);
   else { pickMk[id] = new maplibregl.Marker({ element: placeEl(p), anchor: "bottom", draggable: true }).setLngLat([lon, lat]).addTo(pickMap); pickMk[id].on("dragend", () => { const q = pickMk[id].getLngLat(); setPick(id, q.lat, q.lng, true); }); }
@@ -1214,13 +1242,19 @@ async function boot() {
   if (old) { for (const [id, pts] of Object.entries(old)) await DB.put({ id, pts }); try { localStorage.removeItem(K + "tracks"); } catch (e) { } }
   try { await Graph.load("data/graph.json"); } catch (e) { document.body.innerHTML = "<p style='padding:24px'>路網資料載入失敗，請重新整理。</p>"; return; }
   applyRoadPrefs();
-  await loadPlans();
+  await loadPlans(); globalShift();
   $("dAm").onclick = () => { S.dir = "am"; renderPlan(); }; $("dPm").onclick = () => { S.dir = "pm"; renderPlan(); };
   $("sAm").onclick = () => { S.sigPeriod = "am"; S.editSig = null; renderSignals(); }; $("sPm").onclick = () => { S.sigPeriod = "pm"; S.editSig = null; renderSignals(); };
   $("startBtn").onclick = () => startRide(); $("rStop").onclick = () => finishRide(false); $("rStamp").onclick = stampGreen;
   $("rRecenter").onclick = () => setFollow(true);
   $("rOverview").onclick = () => { if (R.follow) overview(); else setFollow(true); };
   $("rBlock").onclick = blockAhead;
+  $("rSig").addEventListener("click", e => {
+    const b = e.target.closest(".sc-flip"); if (!b || b.dataset.deg === "") return;
+    const r = flipPhase(b.dataset.sid, +b.dataset.deg);
+    toast(r == null ? "這個路口只有一組主要綠燈，無法切換" : "已改用另一組綠燈，之後經過這裡都會用這個方向");
+    renderRide();
+  });
   document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => { show(b.dataset.v); if (b.dataset.v === "sig") renderSignals(); if (b.dataset.v === "set") renderRecords(); });
   $("obSet").onclick = openPicker; $("openPicker").onclick = openPicker;
   $("pkHere").onclick = pickHere; $("pkSave").onclick = savePlaces;

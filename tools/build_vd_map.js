@@ -58,7 +58,7 @@ function extend(path, max) {
   const buf = process.argv[2] ? fs.readFileSync(process.argv[2]) : await get(FEED);
   const secs = parse(zlib.gunzipSync(buf).toString("utf8"));
   const G = await Graph.load("data/graph.json");
-  const W = 121.506, E = 121.548, S = 24.992, N = 25.054;
+  const [W, S, E, N] = JSON.parse(fs.readFileSync(path.join(ROOT, "data/graph.json"))).bbox || [121.506, 24.992, 121.548, 25.054];
   const map = {};
   let tried = 0, ok = 0;
   for (const s of secs) {

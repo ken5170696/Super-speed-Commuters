@@ -403,5 +403,5 @@ function matchTrack(pts) {
   return out;
 }
 
-global.Graph = { G, load, route, project, matchTrack, toXY, toLL, nameOf, shortName, deE, deTo, deFrom, timeAlong, priorDelay, vOf, nearEdges, SPEED_KMH, sigNameById, sigNodeXY, nearestSignal, setLive, edgeOpen, timeCtx, edgeKey: e => [G.eu[e], G.ev[e]].map(n => G.xy[2 * n] + "," + G.xy[2 * n + 1]).join("|"), edgePtsLL: de => dePts(de).map(p => toLL(p[0], p[1])) };
+global.Graph = { G, load, route, project, matchTrack, toXY, toLL, nameOf, shortName, deE, deTo, deFrom, timeAlong, priorDelay, vOf, nearEdges, SPEED_KMH, sigNameById, sigNodeXY, nearestSignal, setLive, edgeOpen, timeCtx, bearingIn: de => deBearIn(de), edgeKey: e => [G.eu[e], G.ev[e]].map(n => G.xy[2 * n] + "," + G.xy[2 * n + 1]).join("|"), edgePtsLL: de => dePts(de).map(p => toLL(p[0], p[1])) };
 })(window);

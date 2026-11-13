@@ -36,6 +36,7 @@ const S = {
   endpoint: load("endpoint", { am: null, pm: null }),
   blocks: load("blocks", []),   // roads you told the app you cannot ride: [{key, name}]
   skips: load("skips", {}),     // "edgeKey|dir" -> times you ignored an instruction to take it
+  phase: load("phase", {}),     // "sid|heading" -> [[phase index, seconds off the official plan], ...]
 };
 /* apply your road blocks and refusals to the routing graph */
 function applyRoadPrefs() {
@@ -168,7 +169,85 @@ function sigStats(period, sid) {
   const w = rec.obs.filter(o => o.kind === "resume" && o.wait).map(o => o.wait);
   return w.length ? { n: w.length, avg: w.reduce((a, b) => a + b, 0) / w.length } : null;
 }
+/* ---------------- official Taipei signal timing plans (free open data, refreshed daily) ---------------- */
+const OFF = { ic: null, bySid: new Map(), info: null };
+async function loadPlans() {
+  try {
+    const j = await (await fetch("data/signal_plans.json")).json();
+    OFF.ic = j.ic; OFF.info = j.infoTime;
+    // link every signal point within 40 m of an official intersection (wide junctions have several)
+    const best = new Map();
+    for (const [n, sid] of G.sigCluster) {
+      const x = G.xy[2 * n], y = G.xy[2 * n + 1];
+      for (const [id, o] of Object.entries(j.ic)) {
+        const d = Math.hypot(o.x - x, o.y - y);
+        if (d <= 40 && (!best.has(sid) || d < best.get(sid)[1])) best.set(sid, [id, d]);
+      }
+    }
+    for (const [sid, [id]] of best) OFF.bySid.set(sid, id);
+  } catch (e) { }
+}
+function planAt(ic, date) {
+  const o = OFF.ic && OFF.ic[ic]; if (!o) return null;
+  const wd = date.getDay(), sched = o.s[o.w[wd === 0 ? 6 : wd - 1]]; if (!sched || !sched.length) return null;
+  const min = date.getHours() * 60 + date.getMinutes();
+  let pid = sched[sched.length - 1][1]; for (const [mm, p] of sched) if (mm <= min) pid = p;
+  const p = o.p[pid]; if (!p) return null;
+  const [C, off, axis, ph] = p, starts = []; let acc = 0;
+  for (const [g, y, ar] of ph) { starts.push(acc); acc += g + y + ar; }
+  return { C, off, axis, ph, starts, pid, ic };
+}
+const hdBucket = deg => Math.round(mod(deg, 360) / 90) % 4;   // 0 N, 1 E, 2 S, 3 W (direction of travel)
+function phaseGuess(P, deg) {
+  // which phase serves you: learned from your stops, else a guess from the plan's main axis
+  const major = P.ph.map((p, i) => ({ i, g: p[0] })).filter(x => x.g >= 12).sort((a, b) => b.g - a.g);
+  if (!major.length) return 0;
+  const along = (hdBucket(deg) % 2 === 0) === (P.axis % 4 === 0);
+  return along || major.length === 1 ? major[0].i : major[1].i;
+}
+function phaseLearned(sid, deg) {
+  const rec = S.phase[sid + "|" + hdBucket(deg)]; if (!rec || rec.length < 2) return null;
+  const cnt = {}; for (const [i] of rec) cnt[i] = (cnt[i] || 0) + 1;
+  const i = +Object.entries(cnt).sort((a, b) => b[1] - a[1])[0][0];
+  const sh = rec.filter(r => r[0] === i).map(r => r[1]);
+  if (sh.length < 2) return null;
+  const mshift = median(sh), spread = median(sh.map(x => Math.abs(x - mshift)));
+  return spread <= 6 ? { i, shift: mshift, n: sh.length } : null;
+}
+function globalShift() {
+  const all = []; for (const k in S.phase) { const [sid, b] = k.split("|"); const l = phaseLearned(sid, b * 90); if (l) all.push(l.shift); }
+  return all.length >= 3 ? median(all) : 0;
+}
+function learnPhase(sid, onsetSec, date, deg) {
+  // compare a "light turned green" moment with the official plan: which phase was it, and how far off is our clock reference
+  const ic = OFF.bySid.get(sid); if (!ic || deg == null) return;
+  const P = planAt(ic, date); if (!P) return;
+  let best = null;
+  P.ph.forEach((p, i) => { if (p[0] < 8) return; let d = mod(onsetSec - (P.off + P.starts[i]), P.C); if (d > P.C / 2) d -= P.C; if (!best || Math.abs(d) < Math.abs(best[1])) best = [i, Math.round(d)]; });
+  if (!best) return;
+  const k = sid + "|" + hdBucket(deg);
+  (S.phase[k] = S.phase[k] || []).push(best); if (S.phase[k].length > 12) S.phase[k].shift();
+  save("phase", S.phase);
+}
+function officialModel(sid, date, deg) {
+  const ic = OFF.bySid.get(sid); if (!ic) return null;
+  const P = planAt(ic, date); if (!P) return null;
+  const L = deg != null ? phaseLearned(sid, deg) : null;
+  const i = L ? L.i : phaseGuess(P, deg == null ? 0 : deg);
+  const shift = L ? L.shift : globalShift();
+  return { cycle: P.C, green: Math.max(3, P.ph[i][0] + P.ph[i][1] - 1), ref: mod(P.off + P.starts[i] + shift, P.C), src: L ? "official" : "official?", n: L ? L.n : 0, plan: P };
+}
+/* best available model for a signal at a given moment: manual > official plan > learned from your stops */
+function modelFor(sid, date, deg) {
+  const period = periodOf(tod(date));
+  const rec = S.sig[sigKey(period, sid)];
+  if (rec && rec.manual && rec.manual.cycle) return sigModel(period, sid);
+  return officialModel(sid, date, deg) || sigModel(period, sid);
+}
+const hasModel = (sid, period) => OFF.bySid.has(sid) || !!sigModel(period, sid);
 function sigDelay(s, period) {
+  const om = officialModel(s.id, new Date(), s.de != null ? Graph.bearingIn(s.de) * 180 / Math.PI : null);
+  if (om) { const r = om.cycle - om.green; return r * r / (2 * om.cycle) + 4 * r / om.cycle; }
   const k = sigKey(period, s.id), rec = S.sig[k], n = S.passes[k];
   if (rec && n >= 2) { const tot = rec.obs.filter(o => o.kind === "resume" && o.wait).reduce((a, o) => a + o.wait, 0); return tot / n; }
   return Graph.priorDelay(s);
@@ -209,7 +288,8 @@ function analyzeTrack(pts) {
       if (dur >= 4) {
         const sp = pts[stopStart], xy = m[stopStart].xy;
         const sg = Graph.nearestSignal(xy[0], xy[1], 45);
-        stops.push({ t: sp[0], resume: p[0], wait: Math.round(dur), lat: sp[1], lon: sp[2], sid: sg ? sg.id : null, name: sg ? Graph.sigNameById(sg.id) : null });
+        const hb = pts.slice(Math.max(0, stopStart - 6), stopStart).reverse().find(q => q[4] != null && q[4] >= 0);
+        stops.push({ t: sp[0], resume: p[0], wait: Math.round(dur), lat: sp[1], lon: sp[2], sid: sg ? sg.id : null, name: sg ? Graph.sigNameById(sg.id) : null, b: hb ? hb[4] : null });
       }
       stopStart = null;
     }
@@ -229,7 +309,12 @@ async function learnFromTracks(only) {
     for (const de of a.deSet) G.habit[de] += 1;
     for (const [de, v] of a.deSpeed) { const arr = deSamples.get(de) || []; arr.push(...v); if (arr.length > 200) arr.splice(0, arr.length - 200); deSamples.set(de, arr); }
     for (const sid of a.sigPassed.keys()) { const k = sigKey(period, sid); S.passes[k] = (S.passes[k] || 0) + 1; }
-    for (const st of a.stops) if (st.sid) addObs(period, st.sid, { kind: "resume", t: Math.round(tod(new Date(st.resume))), wait: st.wait, date: dateStr(new Date(st.t)) });
+    for (const st of a.stops) if (st.sid) {
+      const o = { kind: "resume", t: Math.round(tod(new Date(st.resume))), wait: st.wait, date: dateStr(new Date(st.t)), b: st.b };
+      const rec = sigRec(period, st.sid), dup = rec.obs.some(x => x.date === o.date && Math.abs(x.t - o.t) < 20);
+      addObs(period, st.sid, o);
+      if (!dup) learnPhase(st.sid, o.t - 2, new Date(st.resume), st.b);
+    }
     if (!only) await new Promise(r => setTimeout(r, 0));
   }
   for (const [de, arr] of deSamples) if (arr.length >= 5) G.vLearn[de] = median(arr);
@@ -357,7 +442,7 @@ async function renderPlanMap(plan) {
   setGeo(planMap, "plan-alt", fc(plan.map((o, i) => i === S.sel[S.dir] ? null : lineF(routeCoords(o.r), { i, c: ROUTE_COLORS[i % 5] })).filter(Boolean)));
   setGeo(planMap, "plan-cur", fc(cur ? [lineF(routeCoords(cur.r), { c: ROUTE_COLORS[S.sel[S.dir] % 5] })] : []));
   setGeo(planMap, "plan-traffic", fc(cur ? trafficFeatures(cur.r) : []));
-  setGeo(planMap, "plan-sig", fc(cur ? cur.r.signals.map(s => ptF(lngLat(s.x, s.y), { c: sigModel(S.dir, s.id) ? "#2fc26b" : "#8a949b" })) : []));
+  setGeo(planMap, "plan-sig", fc(cur ? cur.r.signals.map(s => ptF(lngLat(s.x, s.y), { c: hasModel(s.id, S.dir) ? "#2fc26b" : "#8a949b" })) : []));
   addLayer(planMap, { id: "plan-alt", type: "line", source: "plan-alt", layout: ROUND, paint: { "line-color": ["get", "c"], "line-width": 5, "line-opacity": .55 } });
   addLayer(planMap, { id: "plan-cur-case", type: "line", source: "plan-cur", layout: ROUND, paint: { "line-color": "#ffffff", "line-width": 10 } });
   addLayer(planMap, { id: "plan-cur", type: "line", source: "plan-cur", layout: ROUND, paint: { "line-color": ["get", "c"], "line-width": 6 } });
@@ -413,7 +498,8 @@ function renderPlan() {
       <span class="meta">${o.tags.map(t => `<span class="pill ${t === "你最常走的" ? "ok" : "info"}">${esc(t)}</span>`).join(" ")} <span class="num">${(o.r.distance / 1000).toFixed(1)} km</span> · ${o.r.signals.filter(s => s.kind === "junction").length} 路口</span><br>${liveText(o.r)}</span>
       <span class="t num">${mins(o.sec)}<small>分</small></span></button>`).join("");
   $("planRoutes").querySelectorAll(".ritem").forEach(b => b.onclick = () => { S.sel[S.dir] = +b.dataset.i; renderPlan(); });
-  const liveLine = LIVE.err ? LIVE.err + "。" : LIVE.n ? `即時路況：台北市交控中心 ${clock(tod(new Date(LIVE.at)))} 更新，${LIVE.n} 個路段（永和段沒有公開資料）。` : "";
+  const offN = cur ? cur.r.signals.filter(s => OFF.bySid.has(s.id)).length : 0;
+  const liveLine = (offN ? `這條路線有 ${offN} 個號誌有台北市官方時制，騎乘時會預測燈號。` : "") + (LIVE.err ? LIVE.err + "。" : LIVE.n ? `即時路況：台北市交控中心 ${clock(tod(new Date(LIVE.at)))} 更新，${LIVE.n} 個路段（永和段沒有公開資料）。` : "");
   $("planNote").textContent = liveLine + (S.learned ? `已從你的 ${S.learned} 條軌跡學習常走的路和各路段車速。導航時走別條路，會自動重新規劃。` : "還沒有你的軌跡，時間是一般估計。導航時走別條路會自動重新規劃；騎幾趟後，路線和時間會改成依你的習慣。");
   renderPlanMap(plan);
 }
@@ -586,13 +672,14 @@ function checkBetterRoute() {
   }
 }
 function detectStops(f) {
-  if (f.v < 1.2) { if (R.stopStart == null) { R.stopStart = f.t; R.stopXY = f.xy; } }
+  if (f.v < 1.2) { if (R.stopStart == null) { R.stopStart = f.t; R.stopXY = f.xy; R.stopHd = R.last && R.last.hd != null ? R.last.hd * 180 / Math.PI : null; } }
   else if (f.v > 2.5 && R.stopStart != null) {
     const wait = (f.t - R.stopStart) / 1000;
     const sg = Graph.nearestSignal(R.stopXY[0], R.stopXY[1], 45);
     if (wait >= 4 && wait < 300 && sg) {
       const d = new Date(f.t);
-      addObs(periodOf(tod(d)), sg.id, { kind: "resume", t: Math.round(tod(d)), wait: Math.round(wait), date: dateStr(d) });
+      addObs(periodOf(tod(d)), sg.id, { kind: "resume", t: Math.round(tod(d)), wait: Math.round(wait), date: dateStr(d), b: R.stopHd == null ? null : Math.round(R.stopHd) });
+      learnPhase(sg.id, tod(d) - 2, d, R.stopHd);
       R.stopsLog.push({ sid: sg.id, wait: Math.round(wait) });
     }
     R.stopStart = null;
@@ -624,13 +711,15 @@ function fmtDist(m) { return m >= 1000 ? (m / 1000).toFixed(1) + "<small>km</sma
 const fmtDistTxt = m => m >= 1000 ? (m / 1000).toFixed(1) + " km" : Math.round(m / 10) * 10 + " m";
 /* predicted light at a signal when you get there */
 function predict(s, distM, v) {
-  const period = periodOf(tod());
-  const m = sigModel(period, s.id), st = sigStats(period, s.id);
-  if (!m) return { state: "unk", st, m: null };
+  const period = periodOf(tod()), st = sigStats(period, s.id);
   const lt = distM > 150 && R.route ? Graph.timeAlong(R.route, R.d, R.d + distM) : null;
   const tArr = tod() + (lt != null ? lt : distM / Math.max(v, 4));
-  const Lt = lightAt(m, tArr), now = lightAt(m, tod());
-  const conf = m.src === "manual" ? "手動設定" : `已學習 ${m.n} 次`;
+  const deg = s.de != null ? Graph.bearingIn(s.de) * 180 / Math.PI : null;
+  const m = modelFor(s.id, new Date(Date.now() + (tArr - tod()) * 1000), deg);
+  if (!m) return { state: "unk", st, m: null };
+  const mNow = modelFor(s.id, new Date(), deg) || m;
+  const Lt = lightAt(m, tArr), now = lightAt(mNow, tod());
+  const conf = m.src === "manual" ? "手動設定" : m.src === "official" ? `官方時制 · 已用你的停等驗證 ${m.n} 次` : m.src === "official?" ? "官方時制（行向待驗證）" : `已學習 ${m.n} 次`;
   if (Lt.green && Lt.left >= 3) return { state: "go", left: Lt.left, now, m, conf };
   if (Lt.green) return { state: "amber", now, m, conf };
   const tg = tArr + Lt.wait - tod(), vNeed = distM / tg * 3.6;
@@ -699,7 +788,7 @@ function renderRide() {
       big = p.state === "go" ? "綠燈可過" : p.state === "amber" ? "到時轉黃，準備停" : p.state === "slow" ? `收油到 ${p.v} 免停` : `紅燈 約等 ${Math.round(p.wait)} 秒`;
       const nowTxt = p.now.green ? `現在綠燈 剩 ${Math.round(p.now.left)} 秒` : `現在紅燈 剩 ${Math.round(p.now.wait)} 秒`;
       sub = `${nowTxt} · ${p.conf}`;
-      const frac = p.now.green ? p.now.left / p.m.green : p.now.wait / (p.m.cycle - p.m.green);
+      const frac = p.now.green ? p.now.left / Math.max(1, p.m.green) : p.now.wait / Math.max(1, p.m.cycle - p.m.green);
       ringHtml = `<div class="ring-box">${ring(frac, p.now.green ? "#22b35e" : "#e5483d")}<span class="num">${Math.round(p.now.green ? p.now.left : p.now.wait)}</span></div>`;
     }
     card.className = "sigcard " + p.state + (p.state === "unk" ? " compact" : "");
@@ -817,12 +906,13 @@ function renderSignals() {
   for (const k of Object.keys(S.sig)) if (k.startsWith(S.sigPeriod + "_")) ids.add(k.slice(3));
   const plan = S.plan[S.sigPeriod]; if (plan && plan[0]) for (const s of plan[0].r.signals) ids.add(s.id);
   const now = tod();
-  const items = [...ids].map(id => { const rec = S.sig[sigKey(S.sigPeriod, id)]; return { id, n: rec ? rec.obs.length : 0, m: sigModel(S.sigPeriod, id), st: sigStats(S.sigPeriod, id) }; })
+  const refDate = new Date(); if (periodOf(tod(refDate)) !== S.sigPeriod) refDate.setHours(S.sigPeriod === "am" ? 8 : 18, 15, 0, 0);
+  const items = [...ids].map(id => { const rec = S.sig[sigKey(S.sigPeriod, id)]; const sigOnRoute = plan && plan[0] && plan[0].r.signals.find(s => s.id === id); const deg = sigOnRoute && sigOnRoute.de != null ? Graph.bearingIn(sigOnRoute.de) * 180 / Math.PI : null; return { id, n: rec ? rec.obs.length : 0, m: (rec && rec.manual && rec.manual.cycle ? sigModel(S.sigPeriod, id) : officialModel(id, refDate, deg)) || sigModel(S.sigPeriod, id), st: sigStats(S.sigPeriod, id) }; })
     .sort((a, b) => (b.m ? 1 : 0) - (a.m ? 1 : 0) || b.n - a.n);
   $("sigList").innerHTML = items.length ? items.map(({ id, n, m, st }) => {
     let state = "";
     if (m) { const L2 = lightAt(m, now); state = `<span class="dot" style="background:${L2.green ? "var(--go)" : "var(--stop)"}"></span>${L2.green ? "綠 " + Math.round(L2.left) : "紅 " + Math.round(L2.wait)} 秒`; }
-    const status = m ? (m.src === "manual" ? `手動：週期 ${m.cycle} 秒、綠 ${m.green} 秒` : `已學會：週期 ${m.cycle} 秒（${m.n} 次，吻合 ${Math.round(m.R * 100)}%）`) : n ? `已觀察 ${n} 次，再 ${Math.max(0, 4 - n)} 次可推算` : "尚無資料";
+    const status = m ? (m.src === "manual" ? `手動：週期 ${m.cycle} 秒、綠 ${m.green} 秒` : m.src === "official" ? `官方時制：週期 ${m.cycle} 秒、你的綠燈 ${m.green} 秒 · 已驗證` : m.src === "official?" ? `官方時制：週期 ${m.cycle} 秒 · 你的行向待停等驗證` : `已學會：週期 ${m.cycle} 秒（${m.n} 次，吻合 ${Math.round(m.R * 100)}%）`) : n ? `已觀察 ${n} 次，再 ${Math.max(0, 4 - n)} 次可推算` : "尚無資料（台北市以外沒有官方時制）";
     return `<button class="sig-row" data-id="${id}"><span style="min-width:0"><span class="nm">${esc(Graph.sigNameById(id))}</span><br><span class="st">${status}${st ? ` · 平均等 ${Math.round(st.avg)} 秒` : ""}</span></span><span class="st num">${state}</span></button>`;
   }).join("") : '<p class="note">設定家和公司後，這裡會列出路線上的號誌。</p>';
   $("sigList").querySelectorAll(".sig-row").forEach(b => b.onclick = () => { S.editSig = b.dataset.id; S.stamps = []; renderSigEdit(); $("sigEdit").scrollIntoView({ behavior: "smooth" }); });
@@ -1124,6 +1214,7 @@ async function boot() {
   if (old) { for (const [id, pts] of Object.entries(old)) await DB.put({ id, pts }); try { localStorage.removeItem(K + "tracks"); } catch (e) { } }
   try { await Graph.load("data/graph.json"); } catch (e) { document.body.innerHTML = "<p style='padding:24px'>路網資料載入失敗，請重新整理。</p>"; return; }
   applyRoadPrefs();
+  await loadPlans();
   $("dAm").onclick = () => { S.dir = "am"; renderPlan(); }; $("dPm").onclick = () => { S.dir = "pm"; renderPlan(); };
   $("sAm").onclick = () => { S.sigPeriod = "am"; S.editSig = null; renderSignals(); }; $("sPm").onclick = () => { S.sigPeriod = "pm"; S.editSig = null; renderSignals(); };
   $("startBtn").onclick = () => startRide(); $("rStop").onclick = () => finishRide(false); $("rStamp").onclick = stampGreen;

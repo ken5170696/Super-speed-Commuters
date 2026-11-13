@@ -52,7 +52,7 @@ node tools/build_vd_map.js
 - 每個時段跑哪一套時制（平日與假日不同）
 - 每套時制的週期、時差（offset），以及各時相的綠燈、黃燈、全紅秒數
 
-`data/signal_plans.json` 由 `tools/build_signal_plans.py` 產生。原始資料只有路口名稱，沒有座標，所以腳本會用路口的兩條路名，在路網上找出它們的交會點，目前對應到 444 個路口。通勤路線上台北市段約 7～9 成的號誌都有官方時制。
+`data/signal_plans.json` 由 `tools/build_signal_plans.py` 產生。原始資料只有路口名稱，沒有座標，所以腳本會用路口的兩條路名，在路網上找出它們的交會點，目前對應到全台北市 2,828 個路口中的 1,887 個（約 67%）。
 
 **使用方式**
 
@@ -104,7 +104,7 @@ python3 tools/build_signal_plans.py
 ## 限制
 
 - iPhone 的網頁在螢幕關掉或切到其他 App 時會停止定位。導航時會請求螢幕保持開啟，請不要鎖定螢幕。
-- 路網涵蓋永和到中山區（約北緯 24.992–25.054、東經 121.506–121.548）。超出範圍無法規劃路線。
+- 路網涵蓋整個台北市與新北市核心區（板橋、三重、新莊、中永和、新店等；約北緯 24.93–25.21、東經 121.40–121.67）。超出範圍無法規劃路線。
 - 地圖底圖需要網路（[OpenFreeMap](https://openfreemap.org/) 免費向量圖磚，不需金鑰）。路網和規劃都在手機上計算。
 
 ## 隱私
@@ -123,10 +123,14 @@ python3 tools/build_signal_plans.py
 | `data/graph.json` | 機車可行駛的路網：不含高架、快速道路與禁行機車路段，壓縮成路口節點加路段形狀 |
 | `sw.js` | 離線快取 |
 
-重建路網（會從 api.openstreetmap.org 下載資料）：
+路網由 GitHub Actions 的「Build road network」工作建立（每月 2 日自動執行，也可以手動執行）。它會下載 Geofabrik 的台灣 OpenStreetMap 資料，產生路網，再重新對應即時路況路段與官方號誌時制。
+
+在本機重建：
 
 ```bash
-python3 tools/build_graph.py --tiles /path/to/osm-tiles --out data/graph.json
+python3 tools/build_graph.py --pbf taiwan-latest.osm.pbf --bbox 121.40,24.93,121.67,25.21
+node tools/build_vd_map.js
+python3 tools/build_signal_plans.py
 ```
 
 本機測試（瀏覽器只允許 localhost 或 HTTPS 頁面定位）：

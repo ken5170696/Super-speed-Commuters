@@ -63,7 +63,9 @@ node tools/build_vd_map.js
 
 新北市（永和段）沒有公開時制，仍然靠你的停等學習。
 
-更新時制資料（約 60 MB 原始檔，會自動下載）：
+GitHub Actions 每週一凌晨 03:17（台北時間）自動更新一次（`.github/workflows/signal-plans.yml`），只有時制真的改變時才會提交。也可以在 repo 的 Actions 分頁手動執行「Refresh signal timing plans」。
+
+手動更新（約 60 MB 原始檔，會自動下載）：
 
 ```bash
 python3 tools/build_signal_plans.py

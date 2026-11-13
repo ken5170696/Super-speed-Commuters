@@ -1,0 +1,48 @@
+name: Refresh signal timing plans
+
+# Every Monday 03:17 Taipei time (Sunday 19:17 UTC), rebuild data/signal_plans.json
+# from Taipei City's open signal timing plans and commit it only if a plan changed.
+on:
+  schedule:
+    - cron: "17 19 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: signal-plans
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rebuild signal plans
+        run: python3 tools/build_signal_plans.py
+
+      - name: Commit if any plan changed
+        run: |
+          python3 - <<'EOF'
+          import json, subprocess, sys
+          new = json.load(open("data/signal_plans.json", encoding="utf-8"))
+          try:
+              old = json.loads(subprocess.check_output(["git", "show", "HEAD:data/signal_plans.json"]).decode("utf-8"))
+          except subprocess.CalledProcessError:
+              old = {}
+          same = old.get("ic") == new.get("ic")
+          print("plans unchanged" if same else f"plans changed: {len(new['ic'])} intersections")
+          open("plans_same", "w").write("1" if same else "0")
+          EOF
+          if [ "$(cat plans_same)" = "1" ]; then
+            git checkout -- data/signal_plans.json
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/signal_plans.json
+          git commit -m "Refresh Taipei signal timing plans ($(date -u +%Y-%m-%d))"
+          git push

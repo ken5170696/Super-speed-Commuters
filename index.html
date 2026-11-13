@@ -57,6 +57,7 @@
       </div>
     </div>
     <button class="map-btn" id="rRecenter" hidden>置中</button>
+    <button class="stamp-float" id="rStamp" hidden>綠燈亮了 · 記一筆</button>
     <div class="speed-bubble"><span class="num" id="rSpeed">0</span><small>km/h</small></div>
     <div class="sheet">
       <div class="sheet-row">
@@ -65,8 +66,8 @@
       </div>
       <div class="sheet-info" id="rInfo"></div>
       <div class="ride-actions">
-        <button class="btn-ride stamp" id="rStamp" disabled>綠燈亮</button>
         <button class="btn-ride" id="rOverview">概覽</button>
+        <button class="btn-ride" id="rBlock">不能走</button>
         <button class="btn-ride stop" id="rStop">結束</button>
       </div>
       <div class="gps-status" id="rGps"></div>
@@ -100,6 +101,10 @@
         <input type="file" id="impFile" accept=".json,.gpx" multiple hidden>
       </div>
       <p class="small" id="impMsg"></p>
+    </div>
+    <div class="card">
+      <h2>避開的道路</h2>
+      <div id="blockList"></div>
     </div>
     <div class="card">
       <h2>偏好</h2>

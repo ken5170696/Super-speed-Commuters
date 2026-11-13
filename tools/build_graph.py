@@ -46,25 +46,93 @@ def download(d):
         y += .01
 
 
+import re
+DAYS = {"Mo": 0, "Tu": 1, "We": 2, "Th": 3, "Fr": 4, "Sa": 5, "Su": 6}
+
+
+def parse_conditional(v):
+    """'no @ (Mo-Fr 07:00-09:00; Sa 10:00-12:00)' -> [(value, day_mask, start_min, end_min), ...]
+    Public/school-holiday parts are ignored."""
+    out = []
+    for m in re.finditer(r"([A-Za-z]+|-1)\s*@\s*(\([^()]*\)|[^;()]+)", v or ""):
+        val = m.group(1).lower()
+        for part in m.group(2).strip("() ").split(";"):
+            part = re.sub(r"\s*-\s*", "-", part.strip()).replace(": ", ":")
+            if not part or part.startswith(("PH", "SH")):
+                continue
+            mask = 127
+            dm = re.match(r"((?:Mo|Tu|We|Th|Fr|Sa|Su)(?:-(?:Mo|Tu|We|Th|Fr|Sa|Su))?(?:,(?:Mo|Tu|We|Th|Fr|Sa|Su)(?:-(?:Mo|Tu|We|Th|Fr|Sa|Su))?)*)\s+", part)
+            if dm:
+                mask = 0
+                for rng in dm.group(1).split(","):
+                    a, _, b = rng.partition("-")
+                    a, b = DAYS[a], DAYS[b or a]
+                    d = a
+                    while True:
+                        mask |= 1 << d
+                        if d == b: break
+                        d = (d + 1) % 7
+                part = part[dm.end():]
+            for tm in re.finditer(r"(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})", part):
+                h1, m1, h2, m2 = map(int, tm.groups())
+                out.append((val, mask, h1 * 60 + m1, h2 * 60 + m2))
+    return out
+
+
+BAD_NAME = re.compile(r"公車專用道|大客車專用道|計程車專用道|接客|洗車|停車場|地下道|椰林大道")
+
+
 def allowed(t):
+    """Can a 155 cc motorcycle (white plate) legally ride this way?"""
     h = t.get("highway")
     if h not in CLS:
         return False
     mc = t.get("motorcycle")
+    mcc = t.get("motorcycle:conditional", "")
+    if "cc" in mcc:                         # e.g. 'no @ <=250 cc' bans our 155 cc bike
+        return False
     if mc in ("no", "private"):
         return False
     if mc in ("yes", "designated"):
         return True
-    if t.get("access") in ("no", "private") or t.get("area") == "yes":
+    for k in ("access", "vehicle", "motor_vehicle"):
+        if t.get(k) in ("no", "private", "permit", "destination", "customers", "delivery", "agricultural", "forestry"):
+            return False
+    if t.get("area") == "yes":
         return False
     if h in ("trunk", "trunk_link") or t.get("motorroad") == "yes":
         return False
-    nm = t.get("name", "")
-    if any(k in nm for k in ("高架", "快速", "匝道", "交流道")):
+    nm = t.get("name", "") + "|" + t.get("alt_name", "")
+    if any(k in nm for k in ("高架", "快速", "匝道", "交流道")) or BAD_NAME.search(nm):
         return False
-    if h == "service" and t.get("service") in ("parking_aisle", "driveway", "drive-through"):
+    if any(t.get(k) == "designated" for k in ("bus", "psv", "taxi")) and (t.get("motorcar") == "no" or t.get("motor_vehicle") == "no" or h == "service"):
         return False
+    if t.get("motorcar") == "no" and t.get("bus") in ("yes", "designated"):
+        return False
+    if t.get("service") in ("parking_aisle", "driveway", "drive-through", "emergency_access", "driving_learning", "bus"):
+        return False
+    if h == "service" and t.get("tunnel") == "building_passage":
+        return False
+    # banned for (almost) the whole day, e.g. 'no @ (06:00-23:00)'
+    for val, mask, a, b in parse_conditional(mcc):
+        if val == "no" and (b - a) % 1440 >= 12 * 60:
+            return False
     return True
+
+
+def conditions(t):
+    """Time-dependent rules for a way: closures and one-way changes.
+    Returns [(kind, mask, start, end)]: kind 0 closed, 1 one-way forward, 2 one-way backward, 3 two-way."""
+    rules = []
+    for k in ("motorcycle:conditional", "motor_vehicle:conditional", "vehicle:conditional", "access:conditional"):
+        for val, mask, a, b in parse_conditional(t.get(k)):
+            if val in ("no", "private", "destination"):
+                rules.append((0, mask, a, b))
+    for val, mask, a, b in parse_conditional(t.get("oneway:conditional")):
+        kind = {"yes": 1, "-1": 2, "no": 3}.get(val)
+        if kind:
+            rules.append((kind, mask, a, b))
+    return rules
 
 
 def main():
@@ -130,7 +198,7 @@ def main():
             name_idx[s] = len(names); names.append(s)
         return name_idx[s]
 
-    edges, geom, edge_way = [], [], []
+    edges, geom, edge_way, cond = [], [], [], []
     for wid, (nd, t) in ways.items():
         nd = [n for n in nd if n in nodes]
         if len(nd) < 2:
@@ -138,8 +206,10 @@ def main():
         ow = t.get("oneway")
         if t.get("oneway:motorcycle") == "no":
             ow = "no"
+        rules = conditions(t)
         if ow == "-1":
             nd = nd[::-1]; ow = "yes"
+            rules = [({1: 2, 2: 1}.get(k, k), m, s, e2) for k, m, s, e2 in rules]
         oneway = 1 if ow in ("yes", "true", "1") or t.get("junction") == "roundabout" else 0
         nm = name_id(t.get("name") or "")
         cls = CLS[t["highway"]]
@@ -152,6 +222,8 @@ def main():
                     geom.extend([round((lo - LON0) * KX), round((la - LAT0) * KY)])
                 edges.append([nid(start), nid(n), nm, cls, oneway, g0, len(mid)])
                 edge_way.append(wid)
+                for k, m, s, e2 in rules:
+                    cond.extend([len(edges) - 1, k, m, s, e2])
                 start, mid = n, []
             else:
                 mid.append(n)
@@ -176,10 +248,10 @@ def main():
     out = {"v": 1, "built": time.strftime("%Y-%m-%d"), "source": "© OpenStreetMap contributors (ODbL)",
            "proj": {"lat0": LAT0, "lon0": LON0, "kx": KX, "ky": KY},
            "names": names, "xy": xy, "sig": sig, "sigOsm": [osm_ids[i] for i in sig],
-           "edges": [x for e in edges for x in e], "geom": geom, "restr": [x for r in rs for x in r]}
+           "edges": [x for e in edges for x in e], "geom": geom, "restr": [x for r in rs for x in r], "cond": cond}
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     json.dump(out, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
-    print(f"nodes {len(osm_ids)} edges {len(edges)} geom pts {len(geom)//2} signals {len(sig)} restrictions {len(rs)} size {os.path.getsize(a.out)//1024} KB")
+    print(f"nodes {len(osm_ids)} edges {len(edges)} geom pts {len(geom)//2} signals {len(sig)} restrictions {len(rs)} timed rules {len(cond)//5} size {os.path.getsize(a.out)//1024} KB")
 
 
 if __name__ == "__main__":

@@ -31,6 +31,14 @@ async function load(url) {
   G.pc = new Array(M); for (let e = 0; e < M; e++) G.pc[e] = edgePts(e);
   G.isSig = new Uint8Array(G.N); G.sigOsm = new Map(); G.osmNode = new Map();
   j.sig.forEach((n, i) => { G.isSig[n] = 1; G.sigOsm.set(n, j.sigOsm[i]); G.osmNode.set(j.sigOsm[i], n); });
+  // time-dependent rules: closures and peak-hour one-way changes
+  G.cond = new Map(); G.block = new Uint8Array(M); G.skip = new Float32Array(2 * M);
+  const C = j.cond || [];
+  for (let i = 0; i < C.length; i += 5) {
+    const e = C[i], r = [C[i + 1], C[i + 2], C[i + 3], C[i + 4]];
+    (G.cond.get(e) || G.cond.set(e, []).get(e)).push(r);
+    if (r[0] === 3 && G.eow[e] && !G.out[G.ev[e]].includes(2 * e + 1)) G.out[G.ev[e]].push(2 * e + 1);
+  }
   // signal clusters: signal nodes joined by short edges (<45 m) form one intersection; id = smallest OSM id
   G.sigCluster = new Map();
   for (const n of j.sig) {
@@ -119,6 +127,25 @@ function nearEdges(x, y, maxD, heading) {
   return [...out.values()].sort((a, b) => a.d - b.d);
 }
 
+/* ---------- time-dependent access ---------- */
+function timeCtx(d) { d = d || new Date(); return { wd: (d.getDay() + 6) % 7, min: d.getHours() * 60 + d.getMinutes() }; }
+const inWin = (T, r) => (r[1] >> T.wd) & 1 && (r[2] <= r[3] ? T.min >= r[2] && T.min < r[3] : T.min >= r[2] || T.min < r[3]);
+function edgeOpen(de, T) {
+  const e = deE(de), dir = deDir(de);
+  if (G.block[e]) return false;
+  const rules = G.cond.get(e);
+  if (!rules) return !(dir && G.eow[e]);
+  let two = false;
+  for (const r of rules) {
+    if (!inWin(T, r)) continue;
+    if (r[0] === 0) return false;
+    if (r[0] === 1 && dir) return false;
+    if (r[0] === 2 && !dir) return false;
+    if (r[0] === 3) two = true;
+  }
+  return !(dir && G.eow[e]) || two;
+}
+
 /* ---------- cost model ---------- */
 function vOf(de) {
   const base = G.vLearn[de] > 1 ? G.vLearn[de] : SPEED_KMH[G.ecls[deE(de)]] / 3.6;
@@ -142,7 +169,8 @@ function setLive(sections, vdMap) {
   return n;
 }
 function edgeCost(de, habitW) {
-  const t = G.len[deE(de)] / vOf(de);
+  let t = G.len[deE(de)] / vOf(de);
+  if (G.skip[de] > 0) t *= 1 + Math.min(4, G.skip[de] * 1.5);   // roads you keep refusing to take
   if (!habitW) return t;
   const h = G.habit[de];
   return t * (h >= 2 ? 1 - .5 * habitW : h >= 1 ? 1 - .3 * habitW : 1);
@@ -173,12 +201,12 @@ class Heap {
    from: {x,y,heading?}  to: {x,y}  opts: {via: road name, habit: 0..1}
    returns route object or null */
 function route(from, to, opts = {}) {
-  const habitW = opts.habit || 0, via = opts.via || null;
-  let starts = nearEdges(from.x, from.y, 60, from.heading);
-  if (!starts.length) starts = nearEdges(from.x, from.y, 150, null);
+  const habitW = opts.habit || 0, via = opts.via || null, T = timeCtx(opts.time);
+  let starts = nearEdges(from.x, from.y, 60, from.heading).filter(s => edgeOpen(s.de, T));
+  if (!starts.length) starts = nearEdges(from.x, from.y, 150, null).filter(s => edgeOpen(s.de, T));
   if (!starts.length) return null;
   starts = starts.slice(0, 6);
-  const goals = nearEdges(to.x, to.y, 150, null).slice(0, 4);
+  const goals = nearEdges(to.x, to.y, 150, null).filter(g => edgeOpen(g.de, T)).slice(0, 4);
   if (!goals.length) return null;
   const S = via ? 2 : 1, viaId = via ? G.names.indexOf(via) : -1;
   const NS = 2 * G.M * S;
@@ -218,6 +246,7 @@ function route(from, to, opts = {}) {
     }
     for (const de2 of G.out[n]) {
       if (deE(de2) === deE(de) && G.out[n].length > 1) continue;
+      if (!edgeOpen(de2, T)) continue;
       if (!allowedTurn(de, n, de2)) continue;
       const st2 = st === 0 && via && G.ename[deE(de2)] === viaId ? 1 : st;
       const c2 = c + edgeCost(de2, habitW) + turnCost(de, de2) + (G.isSig[deTo(de2)] ? SIG_COST : 0);
@@ -374,5 +403,5 @@ function matchTrack(pts) {
   return out;
 }
 
-global.Graph = { G, load, route, project, matchTrack, toXY, toLL, nameOf, shortName, deE, deTo, deFrom, timeAlong, priorDelay, vOf, nearEdges, SPEED_KMH, sigNameById, sigNodeXY, nearestSignal, setLive, edgePtsLL: de => dePts(de).map(p => toLL(p[0], p[1])) };
+global.Graph = { G, load, route, project, matchTrack, toXY, toLL, nameOf, shortName, deE, deTo, deFrom, timeAlong, priorDelay, vOf, nearEdges, SPEED_KMH, sigNameById, sigNodeXY, nearestSignal, setLive, edgeOpen, timeCtx, edgeKey: e => [G.eu[e], G.ev[e]].map(n => G.xy[2 * n] + "," + G.xy[2 * n + 1]).join("|"), edgePtsLL: de => dePts(de).map(p => toLL(p[0], p[1])) };
 })(window);

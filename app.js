@@ -34,7 +34,16 @@ const S = {
   sigPeriod: new Date().getHours() < 13 ? "am" : "pm",
   passes: {}, learned: 0,
   endpoint: load("endpoint", { am: null, pm: null }),
+  blocks: load("blocks", []),   // roads you told the app you cannot ride: [{key, name}]
+  skips: load("skips", {}),     // "edgeKey|dir" -> times you ignored an instruction to take it
 };
+/* apply your road blocks and refusals to the routing graph */
+function applyRoadPrefs() {
+  const byKey = new Map(); for (let e = 0; e < G.M; e++) byKey.set(Graph.edgeKey(e), e);
+  G.block.fill(0); G.skip.fill(0);
+  for (const b of S.blocks) { const e = byKey.get(b.key); if (e != null) G.block[e] = 1; }
+  for (const [k, n] of Object.entries(S.skips)) { const i = k.lastIndexOf("|"), e = byKey.get(k.slice(0, i)); if (e != null) G.skip[2 * e + +k.slice(i + 1)] = n; }
+}
 function saveSettings() { save("settings", S.settings); }
 function saveTrips() { save("trips", S.trips); }
 
@@ -431,7 +440,7 @@ async function startRide(opts = {}) {
   const plan = S.plan[dir] || computePlan(dir);
   const chosen = opts.auto ? null : plan[S.sel[dir]];
   stopPassive();
-  Object.assign(R, { on: true, dir, dest: xyOf(dest), destLL: dest, destId: dir === "am" ? "office" : endpointId("pm"), fromId: opts.fromId || (fromP && fromP.id) || null, arrivedId: null, route: chosen ? chosen.r : null, pts: [], said: {}, off: 0, lastReroute: 0, follow: true, stopStart: null, stopsLog: [], aMax: null, startT: Date.now(), id: null, pred: null, arriveT: null, lastSave: 0, reroutes: 0, hdSm: null, last: null, d: 0 });
+  Object.assign(R, { on: true, dir, dest: xyOf(dest), destLL: dest, destId: dir === "am" ? "office" : endpointId("pm"), fromId: opts.fromId || (fromP && fromP.id) || null, arrivedId: null, route: chosen ? chosen.r : null, pts: [], said: {}, off: 0, lastReroute: 0, follow: true, stopStart: null, stopsLog: [], aMax: null, startT: Date.now(), id: null, pred: null, arriveT: null, lastSave: 0, reroutes: 0, hdSm: null, last: null, d: 0, onD: null });
   if (S.settings.motion && window.DeviceMotionEvent) {
     try { if (typeof DeviceMotionEvent.requestPermission === "function" && !opts.auto) await DeviceMotionEvent.requestPermission(); window.addEventListener("devicemotion", onMotion); } catch (e) { }
   }
@@ -477,7 +486,7 @@ function setFollow(on) {
 function camera(jump) {
   const f = R.last; if (!f || !rideMap) return;
   const h = rideMap.getContainer().clientHeight;
-  const zoom = f.v < 4 ? 17.6 : f.v < 9 ? 17.1 : 16.6;
+  const zoom = f.v < 4 ? 17 : f.v < 9 ? 16.7 : 16.3;
   const opts = { center: [f.lon, f.lat], bearing: R.hdSm == null ? rideMap.getBearing() : R.hdSm, pitch: 52, zoom, padding: { top: Math.round(h * .42), bottom: 90, left: 0, right: 0 } };
   if (jump) rideMap.jumpTo(opts); else rideMap.easeTo(Object.assign(opts, { duration: 950, easing: t => t }));
 }
@@ -523,7 +532,7 @@ function onFix(pos) {
   else {
     const pr = Graph.project(R.route, xy);
     R.d = pr.d; R.dist = pr.dist;
-    if (pr.dist > Math.max(30, Math.min(60, fix.acc * 1.5))) R.off++; else R.off = 0;
+    if (pr.dist > Math.max(30, Math.min(60, fix.acc * 1.5))) R.off++; else { R.off = 0; R.onD = pr.d; }
     if (R.off >= 3 && Date.now() - R.lastReroute > 4000) reroute(fix, false);
   }
   detectStops(fix);
@@ -533,11 +542,30 @@ function onFix(pos) {
   checkArrival(fix);
   renderRide();
 }
+function edgeAt(r, d) { return r.edges.find(e => e.from <= d && e.to > d) || null; }
+function noteRefusal() {
+  // you left the planned route: the road you were told to take next gets a penalty, so the app stops insisting on it
+  if (!R.route || R.onD == null) return;
+  const e = edgeAt(R.route, R.onD + 25); if (!e) return;
+  const k = Graph.edgeKey(Graph.deE(e.de)) + "|" + (e.de & 1);
+  S.skips[k] = Math.min(5, (S.skips[k] || 0) + 1); G.skip[e.de] = S.skips[k];
+  save("skips", S.skips);
+}
+function blockAhead() {
+  if (!R.route || !R.last) return;
+  const d = R.d || 0, t = R.route.turns.find(x => x.d > d + 3 && x.d - d < 400);
+  const e = edgeAt(R.route, t ? t.d + 15 : d + 60); if (!e) return;
+  const ei = Graph.deE(e.de), name = Graph.shortName(Graph.nameOf(ei)) || "這段路";
+  S.blocks.push({ key: Graph.edgeKey(ei), name, at: dateStr() }); save("blocks", S.blocks); G.block[ei] = 1;
+  reroute(R.last, true);
+  speak(`已避開${name}，重新規劃`); toast(`已避開「${name}」，以後都不會再帶你走這段`);
+}
 function reroute(fix, initial) {
+  if (!initial) noteRefusal();
   R.lastReroute = Date.now();
   const r = Graph.route({ x: fix.xy[0], y: fix.xy[1], heading: fix.v > 2 ? fix.hd : null }, { x: R.dest[0], y: R.dest[1] }, { habit: hasHabit() ? .6 : 0 });
   if (!r) return;
-  R.route = r; R.off = 0; R.d = 0; R.dist = 0;
+  R.route = r; R.off = 0; R.d = 0; R.dist = 0; R.onD = null;
   drawRideRoute();
   if (!initial) { R.reroutes++; const t = r.turns[0]; speak("已改走你目前的路線" + (t ? `，${Math.round(t.d / 50) * 50 || 50}公尺後${turnWord(t.dir)}，${t.onto}` : "")); }
 }
@@ -627,7 +655,7 @@ function renderRide() {
   if (!f) { $("rGps").textContent = "等待 GPS 定位…"; $("rManRoad").textContent = "等待 GPS 定位"; return; }
   $("rGps").textContent = `GPS ±${Math.round(f.acc)} m · 已記錄 ${R.pts.length} 點${R.stopsLog.length ? " · 停 " + R.stopsLog.length + " 次" : ""}${R.reroutes ? " · 重新規劃 " + R.reroutes + " 次" : ""}`;
   $("rSpeed").textContent = Math.round(f.v * 3.6);
-  $("rStamp").disabled = !(f.v < 1);
+  $("rStamp").hidden = !(f.v < 1 && Graph.nearestSignal(f.xy[0], f.xy[1], 45));
   if (!R.route) { $("rManDist").innerHTML = "—"; $("rManRoad").textContent = "規劃路線中…"; return; }
   const r = R.route, d = R.d || 0;
   // traveled part + next turn highlight on the map
@@ -666,7 +694,7 @@ function renderRide() {
   if (first && first.dist < 800 && R.off < 2) {
     const { s, dist, p } = first;
     let big, sub, ringHtml = "";
-    if (p.state === "unk") { big = "號誌未知"; sub = p.st ? `你在這停過 ${p.st.n} 次，平均 ${Math.round(p.st.avg)} 秒` : "停下時會自動學習週期"; }
+    if (p.state === "unk") { big = ""; sub = p.st ? `尚未學會 · 停過 ${p.st.n} 次，平均 ${Math.round(p.st.avg)} 秒` : "尚未學會這個號誌"; }
     else {
       big = p.state === "go" ? "綠燈可過" : p.state === "amber" ? "到時轉黃，準備停" : p.state === "slow" ? `收油到 ${p.v} 免停` : `紅燈 約等 ${Math.round(p.wait)} 秒`;
       const nowTxt = p.now.green ? `現在綠燈 剩 ${Math.round(p.now.left)} 秒` : `現在紅燈 剩 ${Math.round(p.now.wait)} 秒`;
@@ -674,11 +702,11 @@ function renderRide() {
       const frac = p.now.green ? p.now.left / p.m.green : p.now.wait / (p.m.cycle - p.m.green);
       ringHtml = `<div class="ring-box">${ring(frac, p.now.green ? "#22b35e" : "#e5483d")}<span class="num">${Math.round(p.now.green ? p.now.left : p.now.wait)}</span></div>`;
     }
-    card.className = "sigcard " + p.state;
+    card.className = "sigcard " + p.state + (p.state === "unk" ? " compact" : "");
     card.innerHTML = `${ringHtml}<div class="sc-body"><div class="sc-top"><span class="num sc-dist">${fmtDistTxt(dist)}</span><span class="sc-name">${esc(s.name)}</span></div><div class="sc-big">${esc(big)}</div><div class="sc-sub">${esc(sub)}</div></div>`;
     if (p.state !== "unk" && dist < 260 && dist > 110) speak(p.state === "go" ? "前方綠燈，保持" : p.state === "slow" ? `前方紅燈，收油到 ${p.v}` : "前方紅燈", "s" + s.id + p.state);
   } else { card.className = "sigcard empty"; card.innerHTML = ""; }
-  $("rRail").innerHTML = preds.slice(first && first.dist < 800 ? 1 : 0, 4).map(({ s, dist, p }) => `<div class="rail-i"><i style="background:${STATE_COLOR[p.state]}"></i><span class="num">${fmtDistTxt(dist)}</span><b>${esc(sigLabel(p) || "—")}</b></div>`).join("");
+  $("rRail").innerHTML = preds.slice(first && first.dist < 800 ? 1 : 0).filter(x => x.p.state !== "unk").slice(0, 3).map(({ s, dist, p }) => `<div class="rail-i"><i style="background:${STATE_COLOR[p.state]}"></i><span class="num">${fmtDistTxt(dist)}</span><b>${esc(sigLabel(p) || "—")}</b></div>`).join("");
   // ETA, deadline, vs usual, what lies ahead
   const rem = routeTime(r, d, R.dir) * calibFactor(R.dir);
   const arr = tod() + rem;
@@ -836,7 +864,16 @@ function tripEnds(t) {
   const side = t.dir === "am" ? t.from : t.to;
   return side && side !== "home" && placeName(side) ? (t.dir === "am" ? `（從${esc(placeName(side))}）` : `（到${esc(placeName(side))}）`) : "";
 }
+function renderBlocks() {
+  const box = $("blockList"); if (!box) return;
+  const nSkip = Object.keys(S.skips).length;
+  box.innerHTML = (S.blocks.length ? S.blocks.map((b, i) => `<div class="row"><span style="flex:1">${esc(b.name)} <span class="small">${esc(b.at || "")}</span></span><button class="btn" data-i="${i}">恢復</button></div>`).join("") : '<p class="small">還沒有。導航時按「不能走」，就會永久避開前方那段路。</p>')
+    + (nSkip ? `<div class="row"><span class="small" style="flex:1">另外有 ${nSkip} 段路你常不照指示走，規劃時已自動降低優先。</span><button class="btn" id="clrSkip">重設</button></div>` : "");
+  box.querySelectorAll("button[data-i]").forEach(b => b.onclick = () => { S.blocks.splice(+b.dataset.i, 1); save("blocks", S.blocks); applyRoadPrefs(); S.plan = { am: null, pm: null }; renderBlocks(); });
+  const c = $("clrSkip"); if (c) c.onclick = () => { S.skips = {}; save("skips", S.skips); applyRoadPrefs(); S.plan = { am: null, pm: null }; renderBlocks(); };
+}
 function renderRecords() {
+  renderBlocks();
   const H = S.settings.home, O = S.settings.office;
   $("placeVal").textContent = (H && O ? "" : `家：${H ? "已設定" : "未設定"}　公司：${O ? "已設定" : "未設定"}　`) + (allPlaces().length ? "已設定：" + allPlaces().map(p => p.name).join("、") : "");
   $("optVoice").checked = !!S.settings.voice; $("optMotion").checked = !!S.settings.motion; $("optDeadline").value = S.settings.deadline || "09:00";
@@ -1075,7 +1112,7 @@ function show(v) {
   for (const id of ["plan", "ride", "sig", "set", "pick", "trip"]) $("v-" + id).hidden = id !== v;
   const tab = { plan: "plan", sig: "sig", set: "set", pick: "set", trip: "set" }[v];
   document.querySelectorAll("#tabs button").forEach(b => { if (b.dataset.v === tab) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
-  if (v !== "ride") window.scrollTo(0, 0);
+  window.scrollTo(0, 0);
   if (v === "plan" && planMap) setTimeout(() => planMap.resize(), 50);
 }
 function renderAll() { renderPlan(); renderSignals(); renderRecords(); }
@@ -1086,11 +1123,13 @@ async function boot() {
   const old = load("tracks", null);
   if (old) { for (const [id, pts] of Object.entries(old)) await DB.put({ id, pts }); try { localStorage.removeItem(K + "tracks"); } catch (e) { } }
   try { await Graph.load("data/graph.json"); } catch (e) { document.body.innerHTML = "<p style='padding:24px'>路網資料載入失敗，請重新整理。</p>"; return; }
+  applyRoadPrefs();
   $("dAm").onclick = () => { S.dir = "am"; renderPlan(); }; $("dPm").onclick = () => { S.dir = "pm"; renderPlan(); };
   $("sAm").onclick = () => { S.sigPeriod = "am"; S.editSig = null; renderSignals(); }; $("sPm").onclick = () => { S.sigPeriod = "pm"; S.editSig = null; renderSignals(); };
   $("startBtn").onclick = () => startRide(); $("rStop").onclick = () => finishRide(false); $("rStamp").onclick = stampGreen;
   $("rRecenter").onclick = () => setFollow(true);
   $("rOverview").onclick = () => { if (R.follow) overview(); else setFollow(true); };
+  $("rBlock").onclick = blockAhead;
   document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => { show(b.dataset.v); if (b.dataset.v === "sig") renderSignals(); if (b.dataset.v === "set") renderRecords(); });
   $("obSet").onclick = openPicker; $("openPicker").onclick = openPicker;
   $("pkHere").onclick = pickHere; $("pkSave").onclick = savePlaces;

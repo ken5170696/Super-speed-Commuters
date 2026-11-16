@@ -43,7 +43,7 @@
   <!-- 騎乘 -->
   <section class="view ride" id="v-ride" hidden>
     <div id="rideMap" class="map ride-map"></div>
-    <div class="ride-top">
+    <div class="ride-top" id="rTop">
       <div class="maneuver" id="rMan">
         <div class="man-main">
           <div class="man-icon" id="rManIcon"></div>
@@ -51,26 +51,25 @@
         </div>
         <div class="man-then" id="rThen"></div>
       </div>
-      <div class="ride-mid">
-        <div class="sigcard empty" id="rSig"></div>
-        <div class="rail" id="rRail"></div>
-      </div>
+      <div class="sigbar" id="rSig" hidden></div>
     </div>
-    <button class="map-btn" id="rRecenter" hidden>置中</button>
-    <button class="stamp-float" id="rStamp" hidden>綠燈亮了 · 記一筆</button>
-    <div class="speed-bubble"><span class="num" id="rSpeed">0</span><small>km/h</small></div>
-    <div class="sheet">
+    <div class="speed-bubble" id="rSpeedBox"><span class="num" id="rSpeed">0</span><small>km/h</small></div>
+    <div class="float-right" id="rFloat">
+      <button class="map-btn" id="rRecenter" hidden>置中</button>
+      <button class="stamp-float" id="rStamp" hidden>綠燈亮了</button>
+    </div>
+    <div class="sheet" id="rSheet">
       <div class="sheet-row">
-        <div><div class="eta num" id="rEta">--:--</div><div class="small" id="rRemain"></div></div>
-        <div class="sheet-right" id="rStatus"></div>
+        <div class="eta-grp"><span class="eta num" id="rEta">--:--</span><span class="remain" id="rRemain"></span></div>
+        <button class="end-btn" id="rStop">結束</button>
       </div>
+      <div class="sheet-status" id="rStatus"></div>
       <div class="sheet-info" id="rInfo"></div>
-      <div class="ride-actions">
-        <button class="btn-ride" id="rOverview">概覽</button>
-        <button class="btn-ride" id="rBlock">不能走</button>
-        <button class="btn-ride stop" id="rStop">結束</button>
+      <div class="sheet-tools">
+        <button class="link-btn" id="rOverview">概覽</button>
+        <button class="link-btn" id="rBlock">不能走</button>
+        <span class="gps-status" id="rGps"></span>
       </div>
-      <div class="gps-status" id="rGps"></div>
     </div>
   </section>
 

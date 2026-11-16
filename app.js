@@ -274,7 +274,7 @@ function modelFor(sid, date, deg) {
 const hasModel = (sid, period) => OFF.bySid.has(sid) || !!sigModel(period, sid);
 function sigDelay(s, period) {
   const om = officialModel(s.id, new Date(), s.de != null ? Graph.bearingIn(s.de) * 180 / Math.PI : null);
-  if (om) { const r = om.cycle - om.green; return r * r / (2 * om.cycle) + 4 * r / om.cycle; }
+  if (om) { const r = om.cycle - om.green; return Math.min(30, (r * r / (2 * om.cycle) + 4 * r / om.cycle) * .55); }
   const k = sigKey(period, s.id), rec = S.sig[k], n = S.passes[k];
   if (rec && n >= 2) { const tot = rec.obs.filter(o => o.kind === "resume" && o.wait).reduce((a, o) => a + o.wait, 0); return tot / n; }
   return Graph.priorDelay(s);
@@ -557,7 +557,8 @@ async function startRide(opts = {}) {
   if (S.settings.motion && window.DeviceMotionEvent) {
     try { if (typeof DeviceMotionEvent.requestPermission === "function" && !opts.auto) await DeviceMotionEvent.requestPermission(); window.addEventListener("devicemotion", onMotion); } catch (e) { }
   }
-  document.body.classList.add("riding"); show("ride");
+  setAppHeight(); document.documentElement.classList.add("riding");
+  document.body.classList.add("riding"); show("ride"); R.sigOpen = false; layoutRide();
   if (!rideMap) {
     rideMap = mkMap("rideMap", { style: STYLE.nav, nav: true });
     const el = document.createElement("div"); el.className = "puck"; el.innerHTML = "<i></i>";
@@ -593,16 +594,30 @@ function initRideLayers() {
 function setFollow(on) {
   R.follow = on;
   $("rRecenter").hidden = on;
-  $("rOverview").textContent = on ? "概覽" : "導航視角";
+  $("rOverview").textContent = on ? "概覽" : "回到導航";
   if (on && R.last) camera(true);
 }
 function camera(jump) {
   const f = R.last; if (!f || !rideMap) return;
   const h = rideMap.getContainer().clientHeight;
+  const top = $("rTop").offsetHeight, bottom = $("rSheet").offsetHeight;
+  const free = Math.max(120, h - top - bottom);
   const zoom = f.v < 4 ? 17 : f.v < 9 ? 16.7 : 16.3;
-  const opts = { center: [f.lon, f.lat], bearing: R.hdSm == null ? rideMap.getBearing() : R.hdSm, pitch: 52, zoom, padding: { top: Math.round(h * .42), bottom: 90, left: 0, right: 0 } };
+  const opts = { center: [f.lon, f.lat], bearing: R.hdSm == null ? rideMap.getBearing() : R.hdSm, pitch: 50, zoom, padding: { top: Math.round(top + free * .5), bottom, left: 0, right: 0 } };
   if (jump) rideMap.jumpTo(opts); else rideMap.easeTo(Object.assign(opts, { duration: 950, easing: t => t }));
 }
+function layoutRide() {
+  // let floating buttons sit just above the sheet, whatever its height
+  const sh = $("rSheet").offsetHeight;
+  if (sh && sh !== R.sheetH) { R.sheetH = sh; $("v-ride").style.setProperty("--sheet-h", sh + "px"); }
+}
+function setAppHeight() {
+  // iOS home-screen apps report a viewport one status bar shorter than the screen; use the real height
+  const ih = window.innerHeight, sh = window.screen && screen.height;
+  const h = navigator.standalone && sh > ih && sh - ih < 90 ? sh : ih;
+  document.documentElement.style.setProperty("--app-h", h + "px");
+}
+window.addEventListener("resize", setAppHeight); window.addEventListener("orientationchange", () => setTimeout(setAppHeight, 300));
 function overview() {
   if (!R.route) return;
   setFollow(false);
@@ -610,7 +625,7 @@ function overview() {
   const b = c.reduce((b, x) => b.extend(x), new maplibregl.LngLatBounds(c[0], c[0]));
   const h = rideMap.getContainer().clientHeight;
   rideMap.jumpTo({ pitch: 0, bearing: 0, padding: { top: 0, bottom: 0, left: 0, right: 0 } });
-  rideMap.fitBounds(b, { padding: { top: Math.round(h * .22), bottom: Math.round(h * .3), left: 30, right: 30 }, duration: 600 });
+  rideMap.fitBounds(b, { padding: { top: $("rTop").offsetHeight + 20, bottom: $("rSheet").offsetHeight + 20, left: 30, right: 30 }, duration: 600 });
 }
 function drawRideRoute() {
   if (!rideMap || !rideMap.getSource("r-route")) return;
@@ -805,25 +820,29 @@ function renderRide() {
   const ahead = r.signals.filter(x => x.d > d + 8 && x.d - d < 2000);
   const preds = ahead.map(s => ({ s, dist: s.d - d, p: predict(s, s.d - d, f.v) }));
   if (rideMap && rideMap.getSource("r-sig")) setGeo(rideMap, "r-sig", fc(preds.map(({ s, p }) => ptF(lngLat(s.x, s.y), { c: STATE_COLOR[p.state], tc: p.state === "unk" ? "#4a535a" : STATE_COLOR[p.state], lab: sigLabel(p), name: s.name }))));
-  const card = $("rSig");
+  const bar = $("rSig");
   const first = preds[0];
   if (first && first.dist < 800 && R.off < 2) {
     const { s, dist, p } = first;
-    let big, sub, ringHtml = "";
-    if (p.state === "unk") { big = ""; sub = p.st ? `尚未學會 · 停過 ${p.st.n} 次，平均 ${Math.round(p.st.avg)} 秒` : "尚未學會這個號誌"; }
+    let big, dotTxt = "?";
+    if (p.state === "unk") big = "號誌未學會";
     else {
-      big = p.state === "go" ? "綠燈可過" : p.state === "amber" ? "到時轉黃，準備停" : p.state === "slow" ? `收油到 ${p.v} 免停` : `紅燈 約等 ${Math.round(p.wait)} 秒`;
-      const nowTxt = p.now.green ? `現在綠燈 剩 ${Math.round(p.now.left)} 秒` : `現在紅燈 剩 ${Math.round(p.now.wait)} 秒`;
-      sub = `${nowTxt} · ${p.conf}`;
-      const frac = p.now.green ? p.now.left / Math.max(1, p.m.green) : p.now.wait / Math.max(1, p.m.cycle - p.m.green);
-      ringHtml = `<div class="ring-box">${ring(frac, p.now.green ? "#22b35e" : "#e5483d")}<span class="num">${Math.round(p.now.green ? p.now.left : p.now.wait)}</span></div>`;
+      big = p.state === "go" ? "綠燈可過" : p.state === "amber" ? "到時轉黃，準備停" : p.state === "slow" ? `收油到 ${p.v} 免停` : `紅燈，約等 ${Math.round(p.wait)} 秒`;
+      dotTxt = Math.round(p.now.green ? p.now.left : p.now.wait);
     }
-    card.className = "sigcard " + p.state + (p.state === "unk" ? " compact" : "");
-    const flip = p.m && String(p.m.src).startsWith("official") ? `<button class="sc-flip" data-sid="${esc(s.id)}" data-deg="${s.de != null ? Math.round(Graph.bearingIn(s.de) * 180 / Math.PI) : ""}">方向不對</button>` : "";
-    card.innerHTML = `${ringHtml}<div class="sc-body"><div class="sc-top"><span class="num sc-dist">${fmtDistTxt(dist)}</span><span class="sc-name">${esc(s.name)}</span></div><div class="sc-big">${esc(big)}</div><div class="sc-sub">${esc(sub)}</div></div>${flip}`;
+    const dotCls = p.state === "unk" ? "unk" : (p.now.green ? "go" : "stop");
+    let extra = "";
+    if (R.sigOpen) {
+      const conf = p.state === "unk" ? (p.st ? `停過 ${p.st.n} 次，平均等 ${Math.round(p.st.avg)} 秒` : "停下時會自動學習") : `${p.now.green ? "現在綠燈" : "現在紅燈"}，剩 ${Math.round(p.now.green ? p.now.left : p.now.wait)} 秒 · ${p.conf}`;
+      const next = preds.slice(1, 4).map(({ dist: dd, p: pp }) => `<span><i style="background:${STATE_COLOR[pp.state]}"></i>${fmtDistTxt(dd)} ${esc(sigLabel(pp) || "未學會")}</span>`).join("");
+      const flip = p.m && String(p.m.src).startsWith("official") ? `<button class="sb-flip" data-sid="${esc(s.id)}" data-deg="${s.de != null ? Math.round(Graph.bearingIn(s.de) * 180 / Math.PI) : ""}">燈號是另一向的？換一個</button>` : "";
+      extra = `<div class="sb-extra"><div>${esc(conf)}</div>${next ? `<div class="sb-next">${next}</div>` : ""}${flip}</div>`;
+    }
+    bar.hidden = false;
+    bar.innerHTML = `<button class="sb-main"><span class="sb-dot ${dotCls}">${dotTxt}</span><span class="sb-text"><b>${esc(big)}</b><small>${fmtDistTxt(dist)} · ${esc(s.name)}</small></span><span class="sb-more">${R.sigOpen ? "▴" : "▾"}</span></button>${extra}`;
     if (p.state !== "unk" && dist < 260 && dist > 110) speak(p.state === "go" ? "前方綠燈，保持" : p.state === "slow" ? `前方紅燈，收油到 ${p.v}` : "前方紅燈", "s" + s.id + p.state);
-  } else { card.className = "sigcard empty"; card.innerHTML = ""; }
-  $("rRail").innerHTML = preds.slice(first && first.dist < 800 ? 1 : 0).filter(x => x.p.state !== "unk").slice(0, 3).map(({ s, dist, p }) => `<div class="rail-i"><i style="background:${STATE_COLOR[p.state]}"></i><span class="num">${fmtDistTxt(dist)}</span><b>${esc(sigLabel(p) || "—")}</b></div>`).join("");
+  } else { bar.hidden = true; bar.innerHTML = ""; }
+  layoutRide();
   // ETA, deadline, vs usual, what lies ahead
   const rem = routeTime(r, d, R.dir) * calibFactor(R.dir);
   const arr = tod() + rem;
@@ -835,7 +854,7 @@ function renderRide() {
   const usual = S.trips.filter(x => x.dir === R.dir && x.duration > 300 && (R.dir === "am" ? (x.from || "home") === R.fromId : (x.to || "home") === R.destId)).map(x => x.duration);
   if (usual.length >= 3) {
     const delta = median(usual) - ((Date.now() - R.startT) / 1000 + rem);
-    if (Math.abs(delta) >= 30) pills.push(`<span class="pill ${delta > 0 ? "ok" : "warn"}">比平常${delta > 0 ? "快" : "慢"} ${mmss(Math.abs(delta))}</span>`);
+    if (Math.abs(delta) >= 30 && Math.abs(delta) <= 600) pills.push(`<span class="pill ${delta > 0 ? "ok" : "warn"}">比平常${delta > 0 ? "快" : "慢"} ${mmss(Math.abs(delta))}</span>`);
   }
   $("rStatus").innerHTML = `<button class="dest-btn" id="rDest">往 ${esc(placeName(R.destId) || "目的地")} ▾</button>` + pills.join("");
   $("rDest").onclick = () => {
@@ -845,10 +864,10 @@ function renderRide() {
   };
   const sigLeft = r.signals.filter(x => x.d > d + 8);
   const waitLeft = sigLeft.reduce((a, s) => a + sigDelay(s, periodOf(tod())), 0);
-  const info = [`<span>前方 <b class="num">${sigLeft.length}</b> 個號誌，預估等 <b class="num">${mmss(waitLeft)}</b></span>`];
+  const info = [`<span>還有 <b class="num">${sigLeft.length}</b> 個號誌 · 預估等 <b class="num">${mins(waitLeft)}</b> 分</span>`];
   let jam = null, jamLen = 0;
   for (const e of r.edges) { if (e.to <= d || e.from - d > 3000) continue; const mo = G.moe[e.de]; if (mo >= 1) { if (!jam) jam = { from: Math.max(0, e.from - d), mo, name: Graph.shortName(Graph.nameOf(Graph.deE(e.de))) }; jamLen += e.to - Math.max(e.from, d); jam.mo = Math.max(jam.mo, mo); } else if (jam) break; }
-  if (jam) info.push(`<span class="${jam.mo >= 2 ? "t-jam" : "t-slow"}">${jam.from < 30 ? "目前" : fmtDistTxt(jam.from) + " 後"}${jam.mo >= 2 ? "壅塞" : "車流較慢"} ${fmtDistTxt(jamLen)}${jam.name ? "（" + esc(jam.name) + "）" : ""}</span>`);
+  if (jam && jamLen >= 100) info.push(`<span class="${jam.mo >= 2 ? "t-jam" : "t-slow"}">${jam.from < 30 ? "目前" : fmtDistTxt(jam.from) + " 後"}${jam.mo >= 2 ? "壅塞" : "車流較慢"} ${fmtDistTxt(jamLen)}${jam.name ? "（" + esc(jam.name) + "）" : ""}</span>`);
   else if (LIVE.n) info.push('<span class="t-ok">前方 3 km 即時路況順暢</span>');
   $("rInfo").innerHTML = info.join("");
 }
@@ -868,7 +887,7 @@ async function finishRide(auto) {
   if (R.watch != null) navigator.geolocation.clearWatch(R.watch);
   window.removeEventListener("devicemotion", onMotion);
   try { R.wake && R.wake.release(); } catch (e) { }
-  document.body.classList.remove("riding");
+  document.body.classList.remove("riding"); document.documentElement.classList.remove("riding");
   if (R.pts.length > 30) {
     const tr = { id: R.id, pts: R.pts };
     await DB.put(tr);
@@ -1250,7 +1269,8 @@ async function boot() {
   $("rOverview").onclick = () => { if (R.follow) overview(); else setFollow(true); };
   $("rBlock").onclick = blockAhead;
   $("rSig").addEventListener("click", e => {
-    const b = e.target.closest(".sc-flip"); if (!b || b.dataset.deg === "") return;
+    if (e.target.closest(".sb-main")) { R.sigOpen = !R.sigOpen; renderRide(); return; }
+    const b = e.target.closest(".sb-flip"); if (!b || b.dataset.deg === "") return;
     const r = flipPhase(b.dataset.sid, +b.dataset.deg);
     toast(r == null ? "這個路口只有一組主要綠燈，無法切換" : "已改用另一組綠燈，之後經過這裡都會用這個方向");
     renderRide();

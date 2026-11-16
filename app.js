@@ -553,7 +553,7 @@ async function startRide(opts = {}) {
   const plan = S.plan[dir] || computePlan(dir);
   const chosen = opts.auto ? null : plan[S.sel[dir]];
   stopPassive();
-  Object.assign(R, { on: true, dir, dest: xyOf(dest), destLL: dest, destId: dir === "am" ? "office" : endpointId("pm"), fromId: opts.fromId || (fromP && fromP.id) || null, arrivedId: null, route: chosen ? chosen.r : null, pts: [], said: {}, off: 0, lastReroute: 0, follow: true, stopStart: null, stopsLog: [], aMax: null, startT: Date.now(), id: null, pred: null, arriveT: null, lastSave: 0, reroutes: 0, hdSm: null, last: null, d: 0, onD: null });
+  Object.assign(R, { on: true, dir, dest: xyOf(dest), destLL: dest, destId: dir === "am" ? "office" : endpointId("pm"), fromId: opts.fromId || (fromP && fromP.id) || null, arrivedId: null, route: chosen ? chosen.r : null, pts: [], said: {}, off: 0, lastReroute: 0, follow: true, stopStart: null, stopsLog: [], aMax: null, startT: Date.now(), id: null, pred: null, arriveT: null, lastSave: 0, reroutes: 0, hdSm: null, last: null, d: 0, onD: null, mDe: null, mF: 0, mD: null, routeDe: null });
   if (S.settings.motion && window.DeviceMotionEvent) {
     try { if (typeof DeviceMotionEvent.requestPermission === "function" && !opts.auto) await DeviceMotionEvent.requestPermission(); window.addEventListener("devicemotion", onMotion); } catch (e) { }
   }
@@ -603,7 +603,7 @@ function camera(jump) {
   const top = $("rTop").offsetHeight, bottom = $("rSheet").offsetHeight;
   const free = Math.max(120, h - top - bottom);
   const zoom = f.v < 4 ? 17 : f.v < 9 ? 16.7 : 16.3;
-  const opts = { center: [f.lon, f.lat], bearing: R.hdSm == null ? rideMap.getBearing() : R.hdSm, pitch: 50, zoom, padding: { top: Math.round(top + free * .5), bottom, left: 0, right: 0 } };
+  const opts = { center: f.snap ? lngLat(f.snap[0], f.snap[1]) : [f.lon, f.lat], bearing: R.hdSm == null ? rideMap.getBearing() : R.hdSm, pitch: 50, zoom, padding: { top: Math.round(top + free * .5), bottom, left: 0, right: 0 } };
   if (jump) rideMap.jumpTo(opts); else rideMap.easeTo(Object.assign(opts, { duration: 950, easing: t => t }));
 }
 function layoutRide() {
@@ -628,6 +628,7 @@ function overview() {
   rideMap.fitBounds(b, { padding: { top: $("rTop").offsetHeight + 20, bottom: $("rSheet").offsetHeight + 20, left: 30, right: 30 }, duration: 600 });
 }
 function drawRideRoute() {
+  if (R.route) R.routeDe = new Set(R.route.edges.map(e => e.de));
   if (!rideMap || !rideMap.getSource("r-route")) return;
   setGeo(rideMap, "r-route", fc([lineF(routeCoords(R.route))]));
   setGeo(rideMap, "r-traffic", fc(trafficFeatures(R.route)));
@@ -656,16 +657,28 @@ function onFix(pos) {
     if (R.hdSm == null) R.hdSm = deg;
     else { let dlt = ((deg - R.hdSm + 540) % 360) - 180; R.hdSm = (R.hdSm + dlt * (v > 6 ? .55 : .35) + 360) % 360; }
   }
+  // which road are you really on? (heading + continuity, not just the nearest line)
+  const moving = v > 2 && hd != null;
+  if (moving || R.mDe == null) { const m = Graph.matchStep(R.mDe, xy[0], xy[1], moving ? hd : null, fix.acc); if (m) { R.mDe = m.de; R.mF = m.f; R.mD = m.d; } }
+  fix.snap = R.mDe != null && R.mD <= 20 ? Graph.pointAt(R.mDe, R.mF) : null;
   if (!R.route) reroute(fix, true);
   else {
-    const pr = Graph.project(R.route, xy);
+    const pr = Graph.project(R.route, fix.snap || xy);
     R.d = pr.d; R.dist = pr.dist;
-    if (pr.dist > Math.max(30, Math.min(60, fix.acc * 1.5))) R.off++; else { R.off = 0; R.onD = pr.d; }
+    // off route: far from the line, or confidently matched to a road the route does not use (e.g. the parallel road)
+    let onOther = moving && fix.acc <= 20 && R.mDe != null && R.mD <= 15 && R.routeDe && !R.routeDe.has(R.mDe) && fix.snap && pr.dist >= 7;
+    if (onOther && pr.dist < 30) {
+      // a side lane or the other half of the same road is not a different route
+      const here = Graph.shortName(Graph.nameOf(Graph.deE(R.mDe))), seg = R.route.segs.find(s => s.to >= pr.d);
+      if (here && seg && here === seg.name) onOther = false;
+    }
+    if (pr.dist > Math.max(30, Math.min(60, fix.acc * 1.5)) || onOther) R.off++; else { R.off = 0; R.onD = pr.d; }
     if (R.off >= 3 && Date.now() - R.lastReroute > 4000) reroute(fix, false);
   }
   detectStops(fix);
   R.last = fix;
-  if (puck) { puck.setLngLat([fix.lon, fix.lat]); if (fix.hd != null) puck.setRotation(fix.hd * 180 / Math.PI); puck.getElement().classList.toggle("nohead", fix.hd == null); }
+  const shown = fix.snap ? lngLat(fix.snap[0], fix.snap[1]) : [fix.lon, fix.lat];
+  if (puck) { puck.setLngLat(shown); if (fix.hd != null) puck.setRotation(fix.hd * 180 / Math.PI); puck.getElement().classList.toggle("nohead", fix.hd == null); }
   if (R.follow) camera(!last);
   checkArrival(fix);
   renderRide();
@@ -690,12 +703,16 @@ function blockAhead() {
 }
 function reroute(fix, initial) {
   if (!initial) noteRefusal();
+  const prevLabel = R.route && R.route.label;
   R.lastReroute = Date.now();
-  const r = Graph.route({ x: fix.xy[0], y: fix.xy[1], heading: fix.v > 2 ? fix.hd : null }, { x: R.dest[0], y: R.dest[1] }, { habit: hasHabit() ? .6 : 0 });
+  const start = { x: fix.xy[0], y: fix.xy[1], heading: fix.v > 2 ? fix.hd : null };
+  if (R.mDe != null && R.mD <= 20) { start.de = R.mDe; start.f = R.mF; }   // start from the road you are actually on
+  const r = Graph.route(start, { x: R.dest[0], y: R.dest[1] }, { habit: hasHabit() ? .6 : 0 }) || Graph.route({ x: fix.xy[0], y: fix.xy[1] }, { x: R.dest[0], y: R.dest[1] }, { habit: hasHabit() ? .6 : 0 });
   if (!r) return;
   R.route = r; R.off = 0; R.d = 0; R.dist = 0; R.onD = null;
   drawRideRoute();
-  if (!initial) { R.reroutes++; const t = r.turns[0]; speak("已改走你目前的路線" + (t ? `，${Math.round(t.d / 50) * 50 || 50}公尺後${turnWord(t.dir)}，${t.onto}` : "")); }
+  const sameWay = prevLabel && prevLabel === r.label;
+  if (!initial && !sameWay) { R.reroutes++; const t = r.turns[0]; speak("已改走你目前的路線" + (t ? `，${Math.round(t.d / 50) * 50 || 50}公尺後${turnWord(t.dir)}，${t.onto}` : "")); }
 }
 function checkBetterRoute() {
   if (!R.route || !R.last || R.off) return;
@@ -791,7 +808,7 @@ function renderRide() {
   const r = R.route, d = R.d || 0;
   // traveled part + next turn highlight on the map
   if (rideMap && rideMap.getSource("r-done")) {
-    setGeo(rideMap, "r-done", fc([lineF(r.geom.filter(p => p[2] <= d).map(p => lngLat(p[0], p[1])).concat([[f.lon, f.lat]]))]));
+    setGeo(rideMap, "r-done", fc([lineF(r.geom.filter(p => p[2] <= d).map(p => lngLat(p[0], p[1])).concat([f.snap ? lngLat(f.snap[0], f.snap[1]) : [f.lon, f.lat]]))]));
   }
   // maneuver banner
   const man = $("rMan");

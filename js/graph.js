@@ -202,10 +202,14 @@ class Heap {
    returns route object or null */
 function route(from, to, opts = {}) {
   const habitW = opts.habit || 0, via = opts.via || null, T = timeCtx(opts.time);
-  let starts = nearEdges(from.x, from.y, 60, from.heading).filter(s => edgeOpen(s.de, T));
-  if (!starts.length) starts = nearEdges(from.x, from.y, 150, null).filter(s => edgeOpen(s.de, T));
-  if (!starts.length) return null;
-  starts = starts.slice(0, 6);
+  let starts;
+  if (from.de != null && edgeOpen(from.de, T)) starts = [{ de: from.de, f: from.f || 0, d: 0 }];   // the road you are known to be on
+  else {
+    starts = nearEdges(from.x, from.y, 60, from.heading).filter(s => edgeOpen(s.de, T));
+    if (!starts.length) starts = nearEdges(from.x, from.y, 150, null).filter(s => edgeOpen(s.de, T));
+    if (!starts.length) return null;
+    starts = starts.slice(0, 6);
+  }
   const goals = nearEdges(to.x, to.y, 150, null).filter(g => edgeOpen(g.de, T)).slice(0, 4);
   if (!goals.length) return null;
   const S = via ? 2 : 1, viaId = via ? G.names.indexOf(via) : -1;
@@ -221,7 +225,7 @@ function route(from, to, opts = {}) {
   const startF = new Map();
   for (const s of starts) {
     const st = via && G.ename[deE(s.de)] === viaId ? 1 : 0;
-    const id = s.de * S + st, c = (1 - s.f) * edgeCost(s.de, habitW) + s.d * .5;
+    const id = s.de * S + st, c = (1 - s.f) * edgeCost(s.de, habitW) + s.d * 3;   // strongly prefer the road you are closest to
     if (c < dist.get(id)) { dist.set(id, c); prev.set(id, -1); startF.set(s.de, s.f); h.push(c + hEst(deTo(s.de)), id); }
   }
   // goal directed edges: arrive at their start node, then go partially along
@@ -401,6 +405,39 @@ function project(r, p) {
   return best;
 }
 
+/* point at fraction f along a directed edge */
+function pointAt(de, f) {
+  const p = dePts(de); let L = 0; const cum = [0];
+  for (let i = 1; i < p.length; i++) { L += Math.hypot(p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]); cum.push(L); }
+  const t = Math.max(0, Math.min(1, f)) * L;
+  for (let i = 1; i < p.length; i++) if (cum[i] >= t) { const u = (t - cum[i - 1]) / ((cum[i] - cum[i - 1]) || 1); return [p[i - 1][0] + u * (p[i][0] - p[i - 1][0]), p[i - 1][1] + u * (p[i][1] - p[i - 1][1])]; }
+  return p[p.length - 1];
+}
+/* live map matching: which directed edge are you on? Favours roads connected to the previous one
+   and matching your heading, so a parallel road a few metres away does not steal the match. */
+function matchStep(prev, x, y, heading, acc) {
+  const r = Math.max(25, Math.min(50, (acc || 10) * 1.5));
+  const cand = nearEdges(x, y, r, null);
+  if (!cand.length) return null;
+  let best = null;
+  for (const c of cand) {
+    let score = c.d;
+    if (heading != null) {
+      const p = dePts(c.de), k = Math.max(1, Math.min(p.length - 1, Math.round(c.f * (p.length - 1))));
+      const diff = Math.abs(angDiff(bearing(p[k - 1], p[k]), heading));
+      if (diff > .9) continue;               // crossing streets and the opposite carriageway are not candidates
+      score += diff * 15;
+    }
+    if (prev != null) {
+      const same = c.de === prev, next = deFrom(c.de) === deTo(prev), back = deTo(c.de) === deFrom(prev);
+      score += same ? 0 : next || back ? 4 : 14;
+    }
+    if (!best || score < best.score) best = { de: c.de, f: c.f, d: c.d, score };
+  }
+  if (!best && prev != null) { const keep = cand.find(c => c.de === prev); if (keep) return { de: keep.de, f: keep.f, d: keep.d, score: keep.d }; }
+  return best;
+}
+
 /* ---------- map matching for recorded tracks ----------
    pts: [[t, lat, lon, v, ...]]  -> per point {de|-1, xy} */
 function matchTrack(pts) {
@@ -421,5 +458,5 @@ function matchTrack(pts) {
   return out;
 }
 
-global.Graph = { G, load, route, project, matchTrack, toXY, toLL, nameOf, shortName, deE, deTo, deFrom, timeAlong, priorDelay, vOf, nearEdges, SPEED_KMH, sigNameById, sigNodeXY, nearestSignal, signalsNear, setLive, edgeOpen, timeCtx, bearingIn: de => deBearIn(de), edgeKey: e => [G.eu[e], G.ev[e]].map(n => G.xy[2 * n] + "," + G.xy[2 * n + 1]).join("|"), edgePtsLL: de => dePts(de).map(p => toLL(p[0], p[1])) };
+global.Graph = { G, load, route, project, matchTrack, toXY, toLL, nameOf, shortName, deE, deTo, deFrom, timeAlong, priorDelay, vOf, nearEdges, SPEED_KMH, sigNameById, sigNodeXY, nearestSignal, signalsNear, setLive, matchStep, pointAt, edgeOpen, timeCtx, bearingIn: de => deBearIn(de), edgeKey: e => [G.eu[e], G.ev[e]].map(n => G.xy[2 * n] + "," + G.xy[2 * n + 1]).join("|"), edgePtsLL: de => dePts(de).map(p => toLL(p[0], p[1])) };
 })(window);
